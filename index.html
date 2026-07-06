@@ -9344,7 +9344,7 @@ if ('serviceWorker' in navigator) {
 }
 
 // Your public VAPID key (safe to expose in frontend code).
-const VAPID_PUBLIC_KEY = 'BMpoZfXNA1g1_i4-oD6xfbG7kpqAAKEAuK4GtqAKrs09gKTtTwI7hmZ3gxrOLmMbSsaoUAWFKHBEC4V_pVCBMSU';
+const VAPID_PUBLIC_KEY = 'BNhdNqZtxZuNU1teK4q6eNdjBfRR9dMMsynyja0aknOhTkQ0yQ8UakuPMLH7dFGYtYcWfaCG_bV3MCFw4FoDOwc';
 
 // Converts the VAPID public key from base64url into the Uint8Array format
 // the Push API requires.
@@ -9456,8 +9456,27 @@ function refreshNotificationSettingsUI() {
   }
 }
 
+// Compares a subscription's existing applicationServerKey against the VAPID
+// public key currently in use. Returns false if they differ (or can't be read),
+// which means the subscription is dead and must be recreated.
+function subscriptionMatchesCurrentKey(subscription) {
+  try {
+    const currentKey = new Uint8Array(subscription.options.applicationServerKey);
+    const expectedKey = urlBase64ToUint8Array(VAPID_PUBLIC_KEY);
+    if (currentKey.length !== expectedKey.length) return false;
+    for (let i = 0; i < currentKey.length; i++) {
+      if (currentKey[i] !== expectedKey[i]) return false;
+    }
+    return true;
+  } catch (e) {
+    return false; // if we can't read it, safest to treat it as a mismatch
+  }
+}
+
 // saves the subscription to Supabase so the backend can send to it later.
 // Only runs once the user is actually logged in (currentUser must exist).
+// Also detects subscriptions created under an old/rotated VAPID key — those
+// are dead on arrival, so this unsubscribes and creates a fresh one.
 async function subscribeToPush(registration) {
   try {
     if (!('PushManager' in window)) return; // browser doesn't support push
@@ -9467,6 +9486,19 @@ async function subscribeToPush(registration) {
     if (permission !== 'granted') return;
 
     let subscription = await registration.pushManager.getSubscription();
+
+    if (subscription && !subscriptionMatchesCurrentKey(subscription)) {
+      // Tied to an old VAPID key (e.g. after a key rotation) — it can never
+      // receive push again. Drop the stale row and the stale subscription,
+      // then fall through to create a brand new one below.
+      const oldEndpoint = subscription.endpoint;
+      try { await subscription.unsubscribe(); } catch (e) { /* ignore */ }
+      subscription = null;
+      try {
+        await sbQuery('DELETE', 'push_subscriptions', null, `?endpoint=eq.${encodeURIComponent(oldEndpoint)}`);
+      } catch (e) { /* not fatal — the send-notification function also self-cleans dead endpoints */ }
+    }
+
     if (!subscription) {
       subscription = await registration.pushManager.subscribe({
         userVisibleOnly: true,
