@@ -10,9 +10,9 @@ self.addEventListener('push', (event) => {
   const title = data.title || 'New notification';
   const options = {
     body: data.body || '',
-    icon: '/icon-192.png',
-    badge: '/icon-192.png',
-    data: { url: data.url || '/' },
+    icon: '/Dgreatverse/icon-192.png',
+    badge: '/Dgreatverse/icon-192.png',
+    data: { url: data.url || '/Dgreatverse/' },
     vibrate: [200, 100, 200]
   };
 

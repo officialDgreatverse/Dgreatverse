@@ -4353,7 +4353,7 @@ function joinPrivateMessagesRealtime() {
       // Fallback notification — fires whenever the tab is backgrounded,
       // regardless of whether the chat happens to be "open" in the UI.
       const senderName = (contact && contact.name) || 'New message';
-      showFallbackNotification(senderName, 'Sent you a message', '/');
+      showFallbackNotification(senderName, 'Sent you a message', '/Dgreatverse/');
     })
     .on('broadcast', { event: 'reaction_update' }, (msg) => {
       const p = msg.payload;
@@ -4481,7 +4481,7 @@ async function handleIncomingGroupMessage(row) {
   if (!isMine) {
     const g = myGroups.find(g => String(g.id) === String(row.group_id));
     const groupName = (g && g.name) || 'Group chat';
-    showFallbackNotification(groupName, 'New message in group', '/');
+    showFallbackNotification(groupName, 'New message in group', '/Dgreatverse/');
   }
 }
 
@@ -9377,9 +9377,9 @@ function showFallbackNotification(title, body, url) {
     navigator.serviceWorker.ready.then(function(reg) {
       reg.showNotification(title, {
         body: body,
-        icon: '/icon-192.png',
-        badge: '/icon-192.png',
-        data: { url: url || '/' },
+        icon: '/Dgreatverse/icon-192.png',
+        badge: '/Dgreatverse/icon-192.png',
+        data: { url: url || '/Dgreatverse/' },
         vibrate: [200, 100, 200]
       });
     }).catch(function(e) { console.log('Fallback notification failed:', e); });
