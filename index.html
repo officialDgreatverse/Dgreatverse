@@ -3319,6 +3319,54 @@ async function initChatSpace() {
   try { joinGroupMessagesRealtime(); } catch (e) { console.log('joinGroupMessagesRealtime skipped:', e); }
   try { joinPrivateMessagesRealtime(); } catch (e) { console.log('joinPrivateMessagesRealtime skipped:', e); }
   try { joinContactsRealtime(); } catch (e) { console.log('joinContactsRealtime skipped:', e); }
+
+  // If we were opened from a push notification (?chat=<id> or ?group=<id>),
+  // jump straight to that conversation now that contacts/groups are loaded.
+  handleNotificationDeepLink();
+}
+
+// ═══════════════════════════════════════
+// NOTIFICATION DEEP LINKING
+// ═══════════════════════════════════════
+// The send-notification edge function links to `/Dgreatverse/?chat=<userId>`
+// or `/Dgreatverse/?group=<groupId>` (this is a single-page app with no
+// server-side routes, so a real path like /private-chat/123 would 404).
+// This looks up the contact/group and opens the right screen, then cleans
+// the query string so refreshing or going back doesn't reopen it.
+async function handleDeepLinkParams(params) {
+  if (!currentUser) return; // not logged in yet — nothing to open
+  const chatId = params.get('chat');
+  const groupId = params.get('group');
+  if (!chatId && !groupId) return;
+
+  try {
+    if (chatId) {
+      let contact = myContacts.find(u => String(u.id) === String(chatId));
+      if (!contact) {
+        const { data } = await sbQuery('GET', 'users', null, `?id=eq.${chatId}&select=id,name,avatar_url`);
+        if (Array.isArray(data) && data.length) contact = data[0];
+      }
+      if (contact) openPrivateChat(contact.id, contact.name, contact.avatar_url || '');
+    } else if (groupId) {
+      let group = myGroups.find(g => String(g.id) === String(groupId));
+      if (!group) {
+        const { data } = await sbQuery('GET', 'groups', null, `?id=eq.${groupId}&select=id,name,avatar_url`);
+        if (Array.isArray(data) && data.length) group = data[0];
+      }
+      if (group) openGroupChat(group.id, group.name, group.avatar_url || '');
+    }
+  } catch (e) {
+    console.log('Deep link open failed:', e);
+  }
+}
+
+function handleNotificationDeepLink() {
+  const params = new URLSearchParams(location.search);
+  if (!params.get('chat') && !params.get('group')) return;
+  handleDeepLinkParams(params).finally(() => {
+    // Strip the query string so a refresh/back-nav doesn't reopen the chat.
+    history.replaceState({}, '', location.pathname);
+  });
 }
 
 // ═══════════════════════════════════════
@@ -9340,6 +9388,15 @@ if ('serviceWorker' in navigator) {
     navigator.serviceWorker.register('sw.js')
       .then(function(reg) { console.log('SW registered'); subscribeToPush(reg); })
       .catch(function(err) { console.log('SW failed: ', err); });
+  });
+
+  // sw.js posts this when the user taps a notification while a tab is
+  // already open, instead of opening a duplicate window.
+  navigator.serviceWorker.addEventListener('message', function(event) {
+    if (event.data && event.data.type === 'dg-deep-link' && event.data.url) {
+      const u = new URL(event.data.url, location.origin);
+      handleDeepLinkParams(new URLSearchParams(u.search));
+    }
   });
 }
 
