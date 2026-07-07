@@ -5166,6 +5166,7 @@ function previewGroupAvatar(input) {
 // ═══════════════════════════════════════
 function openPrivateChat(userId, userName, avatarUrl) {
   activeChatContact = { id: userId, name: userName, avatar_url: avatarUrl };
+  currentContactLastRead = null; // fresh contact — don't carry over the previous chat's read marker
 
   // Mark as read: record the current timestamp as "last seen" for this contact
   lastSeenMap[userId] = new Date().toISOString();
@@ -5403,7 +5404,15 @@ async function loadPrivateMessages() {
     new Date(m.created_at).getTime() > clearedBefore &&
     !hiddenIds.has(m.id)
   );
-  currentContactLastRead = (Array.isArray(theirReadRows) && theirReadRows.length) ? theirReadRows[0].last_read_at : null;
+  const fetchedLastRead = (Array.isArray(theirReadRows) && theirReadRows.length) ? theirReadRows[0].last_read_at : null;
+  // Never let a re-fetch move the read marker backwards — only forward, or
+  // on first load for this contact. This is what was causing the purple dot
+  // to flicker back to gray: a later reload picking up a technically-real
+  // but older last_read_at than what a live 'messages_read' broadcast had
+  // already advanced it to.
+  if (fetchedLastRead && (!currentContactLastRead || new Date(fetchedLastRead).getTime() > new Date(currentContactLastRead).getTime())) {
+    currentContactLastRead = fetchedLastRead;
+  }
   renderPrivateMessages(visible);
   // Keep the last 100 messages of this conversation cached for offline viewing.
   cacheSave('privmsgs_' + theirId, visible.slice(-100));
