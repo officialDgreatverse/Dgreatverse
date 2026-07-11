@@ -1,0 +1,50 @@
+name: Scaffold Capacitor App
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  scaffold:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Create www folder and move web assets
+        run: |
+          mkdir -p www
+          cp index.html www/ || echo "index.html not found at root"
+          cp manifest.json www/ 2>/dev/null || echo "manifest.json not found, skipping"
+          cp icon-192.png www/ 2>/dev/null || echo "icon-192.png not found, skipping"
+          cp icon-512.png www/ 2>/dev/null || echo "icon-512.png not found, skipping"
+          cp sw.js www/ 2>/dev/null || echo "sw.js not found, skipping"
+
+      - name: Init package.json
+        run: |
+          npm init -y
+          npm install @capacitor/core @capacitor/cli @capacitor/android
+
+      - name: Init Capacitor project
+        run: |
+          npx cap init "DgreatVerse" com.freddie.dgreatverse --web-dir=www
+
+      - name: Add Android platform
+        run: |
+          npx cap add android
+
+      - name: Sync web assets into Android project
+        run: |
+          npx cap sync android
+
+      - name: Commit and push scaffolded project
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --staged --quiet || git commit -m "Scaffold Capacitor Android project for DgreatVerse"
+          git push
