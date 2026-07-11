@@ -1,0 +1,62 @@
+name: Supabase Backup
+
+on:
+  schedule:
+    # Runs every Sunday at 3:00 AM UTC
+    - cron: '0 3 * * 0'
+  workflow_dispatch: {}  # lets you also trigger it manually from the Actions tab
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Install Supabase CLI
+        uses: supabase/setup-cli@v1
+        with:
+          version: latest
+
+      - name: Link Supabase project
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+        run: |
+          supabase link --project-ref ${{ secrets.SUPABASE_PROJECT_REF }} \
+            --password "${{ secrets.SUPABASE_DB_PASSWORD }}"
+
+      - name: Create backup folder with timestamp
+        run: |
+          mkdir -p backups
+          echo "BACKUP_DATE=$(date +'%Y-%m-%d')" >> $GITHUB_ENV
+
+      - name: Dump database schema
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+        run: |
+          supabase db dump --linked -f backups/schema_${{ env.BACKUP_DATE }}.sql
+
+      - name: Dump database data
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+        run: |
+          supabase db dump --linked --data-only -f backups/data_${{ env.BACKUP_DATE }}.sql
+
+      - name: Download Edge Functions
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+        run: |
+          mkdir -p backups/functions_${{ env.BACKUP_DATE }}
+          for fn in account-actions avatar-cleanup cloudinary-cleanup delete-user disappearing-cleanup send-notification stories-cleanup; do
+            supabase functions download "$fn" \
+              --project-ref ${{ secrets.SUPABASE_PROJECT_REF }} \
+              -o backups/functions_${{ env.BACKUP_DATE }} || echo "Could not download $fn"
+          done
+
+      - name: Commit and push backup
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add backups/
+          git diff --staged --quiet || git commit -m "Automated Supabase backup - ${{ env.BACKUP_DATE }}"
+          git push
