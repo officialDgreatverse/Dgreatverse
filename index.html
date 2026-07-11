@@ -1,10 +1,20 @@
+<!--
+  DgreatVerse
+  © 2026 Nyenwe Greatman. All rights reserved.
+
+  This source code is the original work of Nyenwe Greatman
+  (TikTok: @officialdgreatverse | Email: dgreatnation83@gmail.com).
+  Unauthorized copying, redistribution, or reposting of this code or
+  substantial portions of it, under a different name or claimed
+  authorship, is not permitted.
+-->
 <!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
 <title>Dgreatverse</title>
-<link rel="manifest" href="manifest.json">
+
 <meta name="theme-color" content="#7b2fff">
 <meta name="google-site-verification" content="hREc1DBoGQSQTAYz3bG0jk1XMLIik83x16bUeWWa2eA" />
 <meta name="description" content="Dgreatverse — connect, share, and thrive. Chat, share moments, and stay connected with your community.">
@@ -1290,7 +1300,7 @@
 
 <div class="app-wrapper" id="auth-wrapper" style="display:none;">
   <!-- About button fixed top-right on auth screens -->
-  <button onclick="openModal('modal-about')"
+  <button onclick="openAboutModal()"
     style="position:fixed;top:14px;right:16px;z-index:99;
            background:rgba(123,47,255,0.25);border:1px solid rgba(168,85,247,0.5);
            border-radius:20px;color:var(--gold-light);font-size:12px;font-weight:600;
@@ -3049,6 +3059,31 @@ async function sbQuery(method, table, body = null, filters = '') {
     try { data = JSON.parse(text); } catch (e) { data = text; }
   }
   return { data, ok: res.ok, status: res.status };
+}
+
+// Pulls the About modal's Creator/Email/TikTok fields from Supabase (table "app_info").
+// The HTML already has hardcoded values in place, so if this fails (offline, table
+// missing, etc.) the modal still shows correct info — this just overwrites it with
+// whatever's live in the database when it's reachable.
+async function loadAboutInfo() {
+  try {
+    const { data, ok } = await sbQuery('GET', 'app_info', null, '?select=creator_name,email,tiktok&limit=1');
+    if (!ok || !Array.isArray(data) || !data.length) return;
+    const info = data[0];
+    const nameEl = document.getElementById('about-creator-name');
+    const emailEl = document.getElementById('about-email');
+    const tiktokEl = document.getElementById('about-tiktok');
+    if (info.creator_name && nameEl) nameEl.textContent = info.creator_name;
+    if (info.email && emailEl) emailEl.textContent = info.email;
+    if (info.tiktok && tiktokEl) tiktokEl.textContent = info.tiktok;
+  } catch (e) {
+    // Silently keep the hardcoded HTML fallback values.
+  }
+}
+
+function openAboutModal() {
+  openModal('modal-about');
+  loadAboutInfo();
 }
 
 // Safe upsert — checks if a matching row already exists; only inserts if it doesn't.
@@ -8756,21 +8791,21 @@ async function confirmDeletePoll(pollId) {
           <span style="font-size:20px;">👑</span>
           <div>
             <div style="font-size:11px;color:var(--text-muted);letter-spacing:1px;text-transform:uppercase;">Creator</div>
-            <div style="font-size:15px;color:var(--white);font-weight:600;">Greatman Nyenwe</div>
+            <div style="font-size:15px;color:var(--white);font-weight:600;" id="about-creator-name">Greatman Nyenwe</div>
           </div>
         </div>
         <div style="display:flex;align-items:center;gap:12px;">
           <span style="font-size:20px;">✉️</span>
           <div>
             <div style="font-size:11px;color:var(--text-muted);letter-spacing:1px;text-transform:uppercase;">Email</div>
-            <div style="font-size:14px;color:var(--purple-glow);">dgreatnation83@gmail.com</div>
+            <div style="font-size:14px;color:var(--purple-glow);" id="about-email">dgreatnation83@gmail.com</div>
           </div>
         </div>
         <div style="display:flex;align-items:center;gap:12px;">
           <span style="font-size:20px;">🎵</span>
           <div>
             <div style="font-size:11px;color:var(--text-muted);letter-spacing:1px;text-transform:uppercase;">TikTok</div>
-            <div style="font-size:14px;color:var(--purple-glow);">tiktok.com/@officialdgreatverse</div>
+            <div style="font-size:14px;color:var(--purple-glow);" id="about-tiktok">tiktok.com/@officialdgreatverse</div>
           </div>
         </div>
       </div>
