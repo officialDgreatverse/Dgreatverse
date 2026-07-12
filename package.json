@@ -11,8 +11,9 @@
   "description": "",
   "dependencies": {
     "@capacitor/android": "^8.4.1",
-    "@capacitor/cli": "^7.6.7",
+    "@capacitor/cli": "^8.4.1",
     "@capacitor/core": "^8.4.1",
-  "@capacitor/local-notifications": "^8.4.1"
-}
+    "@capacitor/local-notifications": "^8.4.1",
+    "capacitor-native-biometric": "^6.0.0"
+  }
 }
