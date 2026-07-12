@@ -9486,15 +9486,39 @@ function urlBase64ToUint8Array(base64String) {
 // once the app is fully closed, even though the server reports success.
 // As a reliable backup, whenever a message arrives over Supabase Realtime
 // while the tab is open but backgrounded (not focused), we show a
-// notification directly through the service worker — no push service,
-// no encryption, nothing that can be blocked in transit.
-// LIMITATION: this only fires while the tab/app is still alive in the
-// background. If the app has been fully swiped away or the browser killed,
-// only real push (FCM) can wake it — this is a supplement, not a full
-// replacement for that.
+// notification directly — no push service, no encryption, nothing that
+// can be blocked in transit.
+// LIMITATION: this only fires while the app is still alive in the
+// background. If the app has been fully swiped away, only real push (FCM)
+// can wake it — this is a supplement, not a full replacement for that.
+//
+// Inside the APK (Capacitor), the browser's Notification/serviceWorker API
+// doesn't reliably reach the system tray, so we use the native Local
+// Notifications plugin instead. On the regular website, nothing changes —
+// it still uses the service worker path exactly as before.
+let localNotifId = 1000;
 function showFallbackNotification(title, body, url) {
   try {
-    if (!document.hidden) return; // tab is focused — user already sees it live, no need
+    if (!document.hidden) return; // tab/app is focused — user already sees it live
+
+    const isNative = window.Capacitor && window.Capacitor.isNativePlatform && window.Capacitor.isNativePlatform();
+
+    if (isNative) {
+      const LocalNotifications = window.Capacitor.Plugins && window.Capacitor.Plugins.LocalNotifications;
+      if (!LocalNotifications) { console.log('LocalNotifications plugin not found — did you npm install + cap sync?'); return; }
+      LocalNotifications.schedule({
+        notifications: [{
+          id: localNotifId++,
+          title: title,
+          body: body,
+          smallIcon: 'ic_stat_notify', // Android resource name, no extension — see notes below
+          extra: { url: url || '/Dgreatverse/' }
+        }]
+      }).catch(function(e) { console.log('Local notification failed:', e); });
+      return;
+    }
+
+    // Website fallback — unchanged from before
     if (!('serviceWorker' in navigator)) return;
     navigator.serviceWorker.ready.then(function(reg) {
       reg.showNotification(title, {
@@ -9509,6 +9533,22 @@ function showFallbackNotification(title, body, url) {
     console.log('Fallback notification error:', e);
   }
 }
+
+// Ask for local notification permission on native — call this once at
+// startup, alongside your existing push setup.
+async function requestLocalNotificationPermission() {
+  const isNative = window.Capacitor && window.Capacitor.isNativePlatform && window.Capacitor.isNativePlatform();
+  if (!isNative) return;
+  const LocalNotifications = window.Capacitor.Plugins && window.Capacitor.Plugins.LocalNotifications;
+  if (!LocalNotifications) return;
+  try {
+    const perm = await LocalNotifications.requestPermissions();
+    console.log('Local notification permission:', perm);
+  } catch (e) {
+    console.log('Local notification permission request failed:', e);
+  }
+}
+requestLocalNotificationPermission();
 
 // Called when the user explicitly taps "Allow Notifications" in Settings.
 // Gives clear feedback for every permission state instead of failing silently.
