@@ -3875,80 +3875,56 @@ function recoverHcWithPattern() {
   openPatternVerify(() => unlockPendingHiddenChat());
 }
 
-// ─── WEBAUTHN FINGERPRINT / FACE ID (device-local recovery) ────────────
-// Registers a platform-authenticator credential (Face ID/Touch ID/Android
-// fingerprint) scoped to this device only, stored as a credential ID in
-// localStorage. There's no server verifying the signature — like the PIN,
-// this is an app-level gate, not cryptographic proof for a backend. It
-// needs a secure context (HTTPS or localhost); it will work once this is
-// hosted on its real domain even though it can't run from a plain local file.
-function hcB64urlEncode(buf) {
-  return btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-}
-function hcB64urlDecode(str) {
-  str = str.replace(/-/g, '+').replace(/_/g, '/');
-  while (str.length % 4) str += '=';
-  const bin = atob(str);
-  const arr = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
-  return arr;
-}
+// ─── NATIVE BIOMETRIC / PATTERN (device-local recovery) ────────────────
+// Asks the phone's own OS-level biometric prompt directly every time —
+// fingerprint, Face ID, or the device's pattern/PIN as a fallback. Nothing
+// about identity is stored here between checks (no registered credential to
+// lose), so this can't be wiped by a reinstall or a new signed build — it
+// just asks Android/iOS "is this really the device owner" fresh each time,
+// the same way a banking app would. Falls back to a clear message if the
+// native biometric plugin isn't present in this build (e.g. running in a
+// plain desktop browser instead of the packaged app).
+const HcBiometric = (window.Capacitor && window.Capacitor.Plugins) ? window.Capacitor.Plugins.NativeBiometric : null;
 
-async function setupHcFingerprint() {
-  if (!window.PublicKeyCredential) {
-    alert('Fingerprint/Face ID unlock needs a supported browser over HTTPS — this will work once the app is live on its real domain.');
-    return;
-  }
+async function isHcBiometricAvailable() {
+  if (!HcBiometric) return false;
   try {
-    const available = await PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable();
-    if (!available) { alert('No fingerprint or Face ID sensor was found on this device/browser.'); return; }
-    const challenge = crypto.getRandomValues(new Uint8Array(32));
-    const userId = crypto.getRandomValues(new Uint8Array(16));
-    const cred = await navigator.credentials.create({
-      publicKey: {
-        challenge,
-        rp: { name: 'Dgreatverse' },
-        user: { id: userId, name: currentUser.email || currentUser.name || 'user', displayName: currentUser.name || 'User' },
-        pubKeyCredParams: [{ type: 'public-key', alg: -7 }, { type: 'public-key', alg: -257 }],
-        authenticatorSelection: { authenticatorAttachment: 'platform', userVerification: 'required' },
-        timeout: 60000
-      }
-    });
-    localStorage.setItem('dg_recovery_webauthn_id', hcB64urlEncode(cred.rawId));
-    localStorage.setItem('dg_recovery_webauthn_label', new Date().toLocaleDateString());
-    renderHcRecoveryStatus();
-    alert('Fingerprint/Face ID unlock is set up on this device.');
+    const result = await HcBiometric.isAvailable({ useFallback: true });
+    return !!(result && result.isAvailable);
   } catch (e) {
-    console.log('WebAuthn setup failed:', e);
-    alert('Could not set up fingerprint unlock: ' + (e.message || 'unknown error'));
+    return false;
   }
 }
 
 async function verifyHcFingerprint(onSuccess) {
-  const credId = localStorage.getItem('dg_recovery_webauthn_id');
-  if (!credId) { alert('No fingerprint is set up on this device yet. Set one up in Settings → Hidden Chats Recovery.'); return; }
+  if (!HcBiometric) {
+    alert('Fingerprint/pattern check needs the packaged app — this will work once running on your phone.');
+    return;
+  }
   try {
-    const challenge = crypto.getRandomValues(new Uint8Array(32));
-    await navigator.credentials.get({
-      publicKey: {
-        challenge,
-        allowCredentials: [{ id: hcB64urlDecode(credId), type: 'public-key' }],
-        userVerification: 'required',
-        timeout: 60000
-      }
+    await HcBiometric.verifyIdentity({
+      reason: "Verify it's you to open this hidden chat",
+      title: 'Unlock Hidden Chat',
+      subtitle: 'Use your fingerprint, face, or device pattern',
+      useFallback: true,
+      maxAttempts: 3
     });
     onSuccess();
   } catch (e) {
-    console.log('WebAuthn verify failed:', e);
-    alert('Fingerprint check failed or was cancelled.');
+    console.log('Native biometric verify failed:', e);
+    alert('Fingerprint/pattern check failed or was cancelled.');
   }
 }
 
-function removeHcFingerprint() {
-  if (!confirm('Remove the saved fingerprint/Face ID unlock from this device?')) return;
-  localStorage.removeItem('dg_recovery_webauthn_id');
-  localStorage.removeItem('dg_recovery_webauthn_label');
-  renderHcRecoveryStatus();
+function toggleHcFingerprintEnabled() {
+  const enabled = localStorage.getItem('dg_recovery_biometric_enabled') === '1';
+  if (enabled) {
+    localStorage.removeItem('dg_recovery_biometric_enabled');
+    renderHcRecoveryStatus();
+  } else {
+    localStorage.setItem('dg_recovery_biometric_enabled', '1');
+    renderHcRecoveryStatus();
+  }
 }
 
 // ─── PATTERN LOCK (device-local recovery) ──────────────────────────────
@@ -9401,15 +9377,15 @@ function closeHcRecoveryScreen() {
 }
 
 function renderHcRecoveryStatus() {
-  const fpId = localStorage.getItem('dg_recovery_webauthn_id');
+  const fpEnabled = localStorage.getItem('dg_recovery_biometric_enabled') === '1';
   const fpSub = document.getElementById('hc-fingerprint-sub');
   const fpArrow = document.getElementById('hc-fingerprint-arrow');
   if (fpSub) {
-    if (fpId) {
-      fpSub.textContent = 'Registered on this device — tap to remove';
+    if (fpEnabled) {
+      fpSub.textContent = 'Enabled — uses your phone\'s fingerprint/pattern lock';
       fpArrow.textContent = '✓'; fpArrow.style.color = '#3ddc84';
     } else {
-      fpSub.textContent = 'Tap to set up on this device';
+      fpSub.textContent = 'Tap to enable on this device';
       fpArrow.textContent = '›'; fpArrow.style.color = '';
     }
   }
@@ -9427,12 +9403,19 @@ function renderHcRecoveryStatus() {
   }
 }
 
-function handleHcFingerprintRowTap() {
-  if (localStorage.getItem('dg_recovery_webauthn_id')) {
-    if (confirm('Fingerprint/Face ID unlock is set up on this device. Remove it?')) removeHcFingerprint();
-  } else {
-    setupHcFingerprint();
+async function handleHcFingerprintRowTap() {
+  const enabled = localStorage.getItem('dg_recovery_biometric_enabled') === '1';
+  if (enabled) {
+    if (confirm('Turn off fingerprint/pattern unlock for hidden chats on this device?')) toggleHcFingerprintEnabled();
+    return;
   }
+  const available = await isHcBiometricAvailable();
+  if (!available) {
+    alert('No fingerprint, face, or pattern lock was found on this device. Set one up in your phone\'s system settings first.');
+    return;
+  }
+  toggleHcFingerprintEnabled();
+  alert('Fingerprint/pattern unlock is enabled for hidden chats on this device.');
 }
 function handleHcPatternRowTap() {
   if (localStorage.getItem('dg_recovery_pattern_hash')) {
