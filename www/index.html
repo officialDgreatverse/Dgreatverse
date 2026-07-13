@@ -3872,10 +3872,28 @@ function recoverHcWithFingerprint() {
   verifyHcFingerprint(() => unlockPendingHiddenChat());
 }
 function recoverHcWithPattern() {
-  openPatternVerify(() => unlockPendingHiddenChat());
+  verifyHcFingerprint(() => unlockPendingHiddenChat());
 }
 
-// ─── NATIVE BIOMETRIC / PATTERN (device-local recovery) ────────────────
+async function verifyHcPattern(onSuccess) {
+  if (!HcBiometric) {
+    alert('Pattern unlock needs the packaged app — this will work once running on your phone.');
+    return;
+  }
+  try {
+    await HcBiometric.verifyIdentity({
+      reason: "Verify it's you to open this hidden chat",
+      title: 'Unlock Hidden Chat',
+      subtitle: 'Draw your device pattern to unlock',
+      useFallback: true,
+      maxAttempts: 3
+    });
+    onSuccess();
+  } catch (e) {
+    console.log('Native pattern verify failed:', e);
+    alert('Pattern verification failed or was cancelled.');
+  }
+}
 // Asks the phone's own OS-level biometric prompt directly every time —
 // fingerprint, Face ID, or the device's pattern/PIN as a fallback. Nothing
 // about identity is stored here between checks (no registered credential to
@@ -8848,7 +8866,7 @@ async function confirmDeletePoll(pollId) {
         <div>App Version</div>
         <div class="row-sub">Dgreatverse</div>
       </div>
-      <div class="row-arrow" id="app-version-label">v1.0.0</div>
+      <div class="row-arrow" id="app-version-label">v1.0.1-fix</div>
     </div>
     <div class="settings-info-row" onclick="openHelpSupport()">
       <div>
@@ -9540,6 +9558,34 @@ async function enableNotificationsFromSettings() {
   const sub = document.getElementById('notif-settings-sub');
   const arrow = document.getElementById('notif-settings-arrow');
 
+  const isNative = window.Capacitor && window.Capacitor.isNativePlatform && window.Capacitor.isNativePlatform();
+
+  if (isNative) {
+    const LocalNotifications = window.Capacitor.Plugins && window.Capacitor.Plugins.LocalNotifications;
+    if (!LocalNotifications) {
+      sub.textContent = 'Notification plugin not installed in this build';
+      return;
+    }
+    sub.textContent = 'Requesting permission...';
+    try {
+      const perm = await LocalNotifications.requestPermissions();
+      if (perm.display === 'granted') {
+        label.textContent = 'Notifications Enabled';
+        sub.textContent = 'You\'ll be notified of new messages';
+        arrow.textContent = '✓';
+        arrow.style.color = '#3ddc84';
+      } else {
+        label.textContent = 'Notifications Blocked';
+        sub.textContent = 'Enable in your phone\'s app settings';
+        arrow.textContent = '';
+      }
+    } catch (e) {
+      sub.textContent = 'Something went wrong — tap to try again';
+      console.log('Enable notifications failed:', e);
+    }
+    return;
+  }
+
   if (!('serviceWorker' in navigator) || !('PushManager' in window)) {
     sub.textContent = 'Not supported on this browser';
     return;
@@ -9571,11 +9617,46 @@ async function enableNotificationsFromSettings() {
 
 // Reflects the current permission state when Settings opens, so the user
 // isn't shown "Allow Notifications" if they already granted it before.
-function refreshNotificationSettingsUI() {
+async function refreshNotificationSettingsUI() {
   const label = document.getElementById('notif-settings-label');
   const sub = document.getElementById('notif-settings-sub');
   const arrow = document.getElementById('notif-settings-arrow');
   if (!label) return;
+
+  const isNative = window.Capacitor && window.Capacitor.isNativePlatform && window.Capacitor.isNativePlatform();
+
+  if (isNative) {
+    const LocalNotifications = window.Capacitor.Plugins && window.Capacitor.Plugins.LocalNotifications;
+    if (!LocalNotifications) {
+      label.textContent = 'Notifications Unavailable';
+      sub.textContent = 'Notification plugin not installed in this build';
+      arrow.textContent = '';
+      return;
+    }
+    try {
+      const perm = await LocalNotifications.checkPermissions();
+      if (perm.display === 'granted') {
+        label.textContent = 'Notifications Enabled';
+        sub.textContent = 'You\'ll be notified of new messages';
+        arrow.textContent = '✓';
+        arrow.style.color = '#3ddc84';
+      } else if (perm.display === 'denied') {
+        label.textContent = 'Notifications Blocked';
+        sub.textContent = 'Enable in your phone\'s app settings';
+        arrow.textContent = '';
+      } else {
+        label.textContent = 'Allow Notifications';
+        sub.textContent = 'Tap to enable notifications';
+        arrow.textContent = '›';
+        arrow.style.color = '';
+      }
+    } catch (e) {
+      label.textContent = 'Notifications Unavailable';
+      sub.textContent = 'Could not check permission';
+      arrow.textContent = '';
+    }
+    return;
+  }
 
   if (!('Notification' in window)) {
     label.textContent = 'Notifications Unavailable';
