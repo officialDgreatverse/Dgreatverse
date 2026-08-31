@@ -24,6 +24,12 @@ jobs:
       - name: Install npm dependencies
         run: npm install
 
+      - name: Install obfuscator
+        run: npm install javascript-obfuscator --save-dev
+
+      - name: Obfuscate app JS before packaging
+        run: node scripts/obfuscate.js
+
       - name: Sync Capacitor
         run: npx cap sync android
 
