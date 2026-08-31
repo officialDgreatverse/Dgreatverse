@@ -660,6 +660,26 @@
   .zone-tag-chip { flex-shrink:0; padding:7px 14px; border-radius:20px; background:rgba(168,85,247,0.12); border:1px solid rgba(168,85,247,0.3); color:var(--gold-light); font-size:12px; font-weight:600; cursor:pointer; white-space:nowrap; }
   .zone-tag-chip:active { background:rgba(168,85,247,0.25); }
   .zone-posts-grid { display:flex; flex-direction:column; }
+  /* Always-visible floating Home/refresh button — fixed in place over the
+     Discover screen regardless of scroll position, like Facebook's home
+     icon. Tapping it is the ONLY way new posts get pulled in — no
+     background polling, no timers, purely on-demand. */
+  .zone-home-refresh-btn {
+    /* z-index:25 (> .chat-topbar's 20) so this button sits ON TOP of the
+       topbar's stacking layer instead of underneath it. It previously had
+       z-index:6, so even though it rendered visibly in this top-right
+       corner, every tap was swallowed by the (transparent-background but
+       higher-stacked) topbar sitting over the same region, and the button
+       did nothing. */
+    position: absolute; top: 12px; right: 14px; z-index: 25; width: 46px; height: auto; padding: 8px 0 6px;
+    border-radius: 16px; border: none; cursor: pointer; display: flex; flex-direction: column; align-items: center;
+    justify-content: center; gap: 3px; background: linear-gradient(135deg, #7b2fff, #a855f7); color: #fff;
+    box-shadow: 0 4px 14px rgba(123,47,255,0.45);
+  }
+  .zone-home-refresh-btn:active { transform: scale(0.93); }
+  .zone-home-refresh-btn.spinning svg { animation: zoneHomeSpin 0.6s linear; }
+  .zone-home-refresh-label { font-size: 8.5px; font-weight: 700; letter-spacing: 0.3px; color: #fff; line-height: 1; }
+  @keyframes zoneHomeSpin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
   .zone-post-card { border-bottom:1px solid rgba(255,255,255,0.07); padding:14px 0; }
   .zone-post-header { display:flex; align-items:center; gap:9px; padding:0 14px 10px; cursor:pointer; }
   .zone-post-avatar { width:30px; height:30px; border-radius:50%; background:linear-gradient(135deg,var(--purple-bright),#6d28d9); display:flex; align-items:center; justify-content:center; font-size:13px; font-weight:700; color:#fff; overflow:hidden; flex-shrink:0; }
@@ -1644,6 +1664,29 @@
 </div>
 <style>@keyframes splash-spin { to { transform: rotate(360deg); } }</style>
 
+<!-- GLOBAL OFFLINE BANNER — visible on top of whatever screen is showing
+     (login, chat, zone, etc.) any time the device has no connection, so
+     "you're offline" is always visible rather than only surfacing as an
+     alert when someone tries to send something. Toggled by JS via the
+     browser's online/offline events — see setupOfflineBanner() below. -->
+<div id="global-offline-banner" style="display:none;position:fixed;top:0;left:0;right:0;z-index:9998;
+  background:#3a1a5c;color:#e9d8ff;text-align:center;font-size:12px;font-weight:600;
+  letter-spacing:0.3px;padding:7px 10px;box-shadow:0 2px 10px rgba(0,0,0,0.3);">
+  You're offline — showing your last saved chats. Messages will send once you're back online.
+</div>
+
+<!-- SESSION-EXPIRED BANNER — only shown if a long-idle device (e.g. app not
+     opened for many days) comes back online and Supabase reports the saved
+     session is no longer valid. We don't auto-kick the person out of what's
+     on screen (see refreshSessionInBackground) — this just lets them know
+     a fresh login is needed to send/receive anything new. -->
+<div id="session-expired-banner" style="display:none;position:fixed;top:0;left:0;right:0;z-index:9998;
+  background:#5c1a1a;color:#ffd8d8;text-align:center;font-size:12px;font-weight:600;
+  letter-spacing:0.3px;padding:7px 10px;box-shadow:0 2px 10px rgba(0,0,0,0.3);cursor:pointer;"
+  onclick="logout()">
+  Your session has expired — tap here to log in again
+</div>
+
 <div class="app-wrapper" id="auth-wrapper" style="display:none;">
   <!-- About button fixed top-right on auth screens -->
   <button onclick="openAboutModal()"
@@ -2052,7 +2095,11 @@
     <span style="display:flex;align-items:center;gap:8px;font-size:12px;font-weight:600;letter-spacing:0.2px;">Business &amp; Partnership Inquiries</span>
     <span style="display:flex;align-items:center;gap:5px;font-size:10.5px;color:var(--text-muted);font-weight:600;">Contact Us <span style="font-size:12px;">›</span></span>
   </button>
-  <div style="flex:1;overflow-y:auto;">
+  <button type="button" id="zone-home-refresh-btn" class="zone-home-refresh-btn" onclick="refreshZoneHome()" title="Refresh — show latest">
+    <svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 11l9-8 9 8"/><path d="M5 10v10h14V10"/></svg>
+    <span class="zone-home-refresh-label">Refresh</span>
+  </button>
+  <div style="flex:1;overflow-y:auto;position:relative;" id="zone-scroll-pane" onscroll="onZoneScroll()">
     <!-- Browse view: trending channels strip + a post grid underneath -->
     <div id="zone-browse-view">
       <div id="zone-trending-section" style="display:none;">
@@ -2065,6 +2112,7 @@
       </div>
       <div class="zone-section-title">Discover</div>
       <div class="zone-posts-grid" id="zone-posts-grid"></div>
+      <div id="zone-posts-loading-more" style="display:none;text-align:center;color:var(--text-muted);font-size:11px;padding:14px;">Loading more…</div>
       <div id="empty-zone-posts-hint" style="display:none;text-align:center;color:var(--text-muted);font-size:12px;padding:24px 14px;">
         No posts yet.
       </div>
@@ -3252,17 +3300,27 @@ const sbRealtime = supabase.createClient(SUPABASE_URL, SUPABASE_KEY, {
 // will correctly show the login screen again afterward.
 async function tryAutoLogin() {
   try {
-    // OFFLINE FAST PATH — never touch the network while offline.
-    // sbRealtime.auth.getSession() can try to silently refresh the token
-    // over the network when it's close to expiring, and on a dead
-    // connection that call can hang for a long time and then fail —
-    // which is exactly what was bouncing people back to the login screen
-    // instead of into their account while offline. So if the device is
-    // offline, skip getSession() entirely and restore straight from what
-    // we already saved to localStorage during the last successful login.
-    if (!navigator.onLine) {
-      return restoreOfflineSession();
+    // CACHE-FIRST, ALWAYS — same idea as WhatsApp opening straight into
+    // your last chats instead of making you wait while it confirms you're
+    // still logged in. We used to only do this when navigator.onLine was
+    // false, but navigator.onLine can report "online" on a dead or very
+    // slow connection (weak signal, captive wifi, etc.) — in that case the
+    // network branch below would sit there waiting on getSession() before
+    // showing anything at all. So: if we have a session+profile saved
+    // locally from the last successful login, restore from it immediately
+    // and unconditionally, then quietly verify/refresh over the network in
+    // the background if we're online. Nothing about sending messages
+    // changes here — that still requires a live connection and is blocked
+    // elsewhere (see the navigator.onLine checks on send actions).
+    if (restoreCachedSession()) {
+      if (navigator.onLine) refreshSessionInBackground();
+      return true;
     }
+
+    // No local cache to fall back on (first login ever on this device, or
+    // it was cleared by logging out) — the only path left is a real
+    // network check, so we do need connectivity for that.
+    if (!navigator.onLine) return false;
 
     const { data: sessionData } = await sbRealtime.auth.getSession();
     const session = sessionData && sessionData.session;
@@ -3310,13 +3368,71 @@ async function tryAutoLogin() {
   }
 }
 
-// Offline session restore — used only when navigator.onLine is false.
-// Reads the session Supabase already persisted to localStorage (from the
-// last time this device logged in successfully while online) plus the
-// profile we cached at that same time, and drops the user straight into
-// their account. No network requests are made here at all, so there's
-// nothing that can hang or time out.
-function restoreOfflineSession() {
+// Once the cache-first restore above has already put the person into the
+// chat space instantly, this quietly re-verifies the session and refreshes
+// the profile over the network — same network calls the old blocking path
+// used to make BEFORE showing anything, just moved to run silently after.
+// If the session turns out to be genuinely invalid (e.g. revoked, password
+// changed elsewhere), we deliberately do nothing drastic here — the person
+// stays in with what's cached rather than getting yanked back to a login
+// screen mid-session; the next explicit logout/login will resolve it.
+async function refreshSessionInBackground(_isRetry) {
+  try {
+    const { data: sessionData } = await sbRealtime.auth.getSession();
+    const session = sessionData && sessionData.session;
+    if (!session) {
+      // Don't declare the session dead off a single empty result — that can
+      // happen from a one-off flaky request, not just a genuinely invalid
+      // refresh token. Give it one more real attempt a few seconds later
+      // before showing anything to the person.
+      if (!_isRetry) {
+        setTimeout(() => refreshSessionInBackground(true), 4000);
+        return;
+      }
+      // Confirmed on a second try, with network available both times —
+      // this really is a dead session (e.g. revoked, password changed
+      // elsewhere), not a connectivity blip. There's no way to silently
+      // recover this without storing the password on the device, which we
+      // deliberately never do. Let the person know, without disturbing
+      // whatever they're already looking at.
+      const banner = document.getElementById('session-expired-banner');
+      if (banner) banner.style.display = 'block';
+      return;
+    }
+
+    // Success — make sure any stale expired-banner from an earlier failed
+    // attempt is cleared now that we're confirmed good again.
+    const banner = document.getElementById('session-expired-banner');
+    if (banner) banner.style.display = 'none';
+
+    currentAccessToken = session.access_token;
+    const authUser = session.user;
+
+    const { data: rows } = await sbQuery('GET', 'users', null,
+      `?id=eq.${authUser.id}&select=id,name,email,chat_code,avatar_url,avatar_public_id,about,is_vip,vip_expires_at`);
+    const profile = rows && rows[0];
+    if (!profile) return;
+
+    localStorage.setItem('dgreatverse-cached-profile', JSON.stringify(profile));
+    currentUser = { ...profile, email: authUser.email };
+    if (currentUser.avatar_url) _applyAvatar(currentUser.avatar_url);
+    const codeEl = document.getElementById('display-chat-code');
+    if (codeEl) codeEl.textContent = currentUser.chat_code || '—';
+  } catch (e) {
+    // Threw outright — a real network failure, not Supabase telling us the
+    // session is invalid. Leave everything as-is; the 'online' listener
+    // below will naturally trigger another attempt once connectivity is
+    // actually back.
+  }
+}
+
+// Cache-first session restore — reads the session Supabase already
+// persisted to localStorage (from the last time this device logged in
+// successfully) plus the profile we cached at that same time, and drops
+// the person straight into their account. No network requests are made
+// here at all, so there's nothing that can hang or time out, and it's
+// safe to call whether the device is online or offline.
+function restoreCachedSession() {
   try {
     const rawSession = localStorage.getItem('dgreatverse-auth');
     const rawProfile = localStorage.getItem('dgreatverse-cached-profile');
@@ -3330,9 +3446,9 @@ function restoreOfflineSession() {
     currentAccessToken = session.access_token || null;
     currentUser = { ...profile, email: authUser.email || profile.email };
 
-    // Skip the ad screen entirely while offline — it fetches ad URLs over
-    // the network, and there's no reason to make someone wait on a spinner
-    // for something that will just fall back to blank anyway. Go straight in.
+    // Skip the ad screen on this instant cache-first restore — it fetches
+    // ad URLs over the network, and there's no reason to make someone wait
+    // on a spinner for that before they can see their chats. Go straight in.
     document.getElementById('auth-wrapper').style.display = 'none';
     const aboutBtn = document.getElementById('auth-about-btn');
     if (aboutBtn) aboutBtn.style.display = 'none';
@@ -3343,10 +3459,27 @@ function restoreOfflineSession() {
   }
 }
 
+// GLOBAL OFFLINE BANNER — always shows/hides with real connectivity,
+// independent of which screen is active, so "you're offline" is visible
+// the whole time rather than only when an action happens to be attempted.
+function setupOfflineBanner() {
+  const banner = document.getElementById('global-offline-banner');
+  if (!banner) return;
+  const sync = () => { banner.style.display = navigator.onLine ? 'none' : 'block'; };
+  window.addEventListener('online', sync);
+  window.addEventListener('offline', sync);
+  sync(); // set correct state immediately on boot, don't wait for an event
+}
+setupOfflineBanner();
+
 // Once connectivity comes back while the app is already open and logged
 // in, quietly refresh everything (profile, contacts, groups, requests) so
 // the "online session" becomes fully live again — no user action needed.
+// Also re-attempts the session check itself, so a stale "session expired"
+// banner (possibly from a flaky connection rather than a truly dead
+// session) gets a fresh chance to quietly resolve itself.
 window.addEventListener('online', () => {
+  if (currentUser) refreshSessionInBackground();
   const chatScreen = document.getElementById('screen-chat');
   if (currentUser && chatScreen && chatScreen.classList.contains('active')) {
     initChatSpace();
@@ -3822,14 +3955,19 @@ async function fetchStickersFromEdge() {
       },
     });
     const text = await res.text();
-    if (!res.ok) { alert('STICKER DEBUG — HTTP ' + res.status + ': ' + text); return { packs: {}, isVip: false }; }
+    // These used to be alert() calls — meant as temporary dev debugging,
+    // but left in and firing as blocking popups for real users (e.g. the
+    // fetch always fails while offline, so an "OK" dialog interrupted the
+    // whole screen on every offline app open). Logged instead now; the
+    // caller already handles an empty packs/{} result gracefully.
+    if (!res.ok) { console.log('STICKER DEBUG — HTTP ' + res.status + ': ' + text); return { packs: {}, isVip: false }; }
     let parsed;
-    try { parsed = JSON.parse(text); } catch (e) { alert('STICKER DEBUG — bad JSON: ' + text); return { packs: {}, isVip: false }; }
-    if (parsed.error) alert('STICKER DEBUG — function returned error: ' + parsed.error);
-    if (!parsed.packs || !Object.keys(parsed.packs).length) alert('STICKER DEBUG — no packs in response. Full body: ' + text.slice(0, 500));
+    try { parsed = JSON.parse(text); } catch (e) { console.log('STICKER DEBUG — bad JSON: ' + text); return { packs: {}, isVip: false }; }
+    if (parsed.error) console.log('STICKER DEBUG — function returned error: ' + parsed.error);
+    if (!parsed.packs || !Object.keys(parsed.packs).length) console.log('STICKER DEBUG — no packs in response. Full body: ' + text.slice(0, 500));
     return parsed;
   } catch (e) {
-    alert('STICKER DEBUG — fetch threw: ' + e);
+    console.log('STICKER DEBUG — fetch threw: ' + e);
     return { packs: {}, isVip: false };
   }
 }
@@ -3861,6 +3999,11 @@ function _setStickerBadge(show) {
 async function loadStickerCache(force) {
   if (_stickerCache && !force) return _stickerCache;
   if (_stickerFetchInFlight) return _stickerFetchInFlight;
+  // Skip the network entirely while offline — same pattern as loadContacts.
+  // Without this, every offline app open queued up a doomed fetch that just
+  // failed a few seconds later (previously surfacing as a disruptive
+  // "STICKER DEBUG" alert on top of the offline-restored screen).
+  if (!navigator.onLine) return _stickerCache || {};
   _stickerFetchInFlight = (async () => {
     const { packs: grouped, isVip } = await fetchStickersFromEdge();
     _stickerCache = grouped;
@@ -5463,6 +5606,15 @@ let followedChannels = [];
 let allZoneChannels = [];
 let zoneTrendingChannels = [];
 let zoneDiscoverPosts = [];
+// Pagination state for the Discover feed. New posts never get spliced into
+// the feed while the user is scrolling — that would shift everything under
+// their thumb. Nothing checks for new posts in the background (no timers,
+// no polling); the fixed Home button is the only way a refresh happens,
+// on-tap only, same as Facebook's home icon.
+let _zoneOldestPostAt = null;   // created_at of the oldest post currently rendered (pagination cursor)
+let _zoneHasMorePosts = true;
+let _zoneLoadingMore = false;
+const ZONE_DISCOVER_PAGE_SIZE = 30;
 let zoneChannelById = {};
 let _zoneAdPosts = [];     // every ad-master channel's current eligible posts — empty array if none, insertion just skips
 let _zoneAdStartIndex = 0; // where in _zoneAdPosts this load's rotation begins — see next_zone_ad_indices
@@ -5524,14 +5676,32 @@ function closeChannelsScreen() {
 }
 
 // ═══ ZONE — discovery feed: search & browse every public channel ═══
+// Loaded exactly once per app session (first time the tab is opened, or
+// after a full app reload). Switching to another tab and back must NOT
+// pull in newer posts — only the Home/refresh button (or leaving and
+// reopening the app) is allowed to do that.
+let _zoneInitialLoadDone = false;
 function openZoneScreen() {
   document.getElementById('screen-zone').classList.add('active');
   document.getElementById('zone-search-input').value = '';
   filterZoneChannels('');
-  loadZoneChannels();
+  if (!_zoneInitialLoadDone) {
+    _zoneInitialLoadDone = true;
+    loadZoneChannels();
+  }
 }
 function closeZoneScreen() {
   document.getElementById('screen-zone').classList.remove('active');
+}
+
+// Fires on every scroll of the Discover pane — loads the next page once
+// the user nears the bottom, same "near bottom" pattern used elsewhere in
+// the app for chat panes.
+function onZoneScroll() {
+  const pane = document.getElementById('zone-scroll-pane');
+  if (!pane || document.getElementById('zone-browse-view').style.display === 'none') return;
+  const nearBottom = pane.scrollHeight - pane.scrollTop - pane.clientHeight < 400;
+  if (nearBottom) loadMoreZoneDiscoverPosts();
 }
 
 async function loadZoneChannels() {
@@ -5573,8 +5743,11 @@ async function loadZoneDiscoverPosts() {
   // post shows up twice: once untagged at its normal chronological spot,
   // and again as the spliced-in ad.
   const { data } = await sbQuery('GET', 'channel_posts', null,
-    `?media_url=not.is.null&expires_at=gt.${now}&channel_id=neq.${AD_MASTER_CHANNEL_ID}&select=*&order=created_at.desc&limit=30`);
+    `?media_url=not.is.null&expires_at=gt.${now}&channel_id=neq.${AD_MASTER_CHANNEL_ID}&select=*&order=created_at.desc&limit=${ZONE_DISCOVER_PAGE_SIZE}`);
   zoneDiscoverPosts = data || [];
+  // Reset the pagination cursor to this fresh load.
+  _zoneOldestPostAt = zoneDiscoverPosts.length ? zoneDiscoverPosts[zoneDiscoverPosts.length - 1].created_at : null;
+  _zoneHasMorePosts = zoneDiscoverPosts.length === ZONE_DISCOVER_PAGE_SIZE;
   allZoneChannels.forEach(c => { zoneChannelById[c.id] = c; });
 
   // Fetch every active ad-master post (not just the newest one) so
@@ -5668,6 +5841,63 @@ async function renderZoneDiscoverPosts() {
 
   grid.innerHTML = displayList.map(p => buildZonePostCardHtml(p, likedSet.has(p.id))).join('');
   renderZoneTrendingTags();
+}
+
+// ── Infinite scroll: older posts, appended to the bottom ──
+// Safe to call while the user is mid-scroll — it only ever appends past
+// the last card, so nothing already on screen moves.
+async function loadMoreZoneDiscoverPosts() {
+  if (_zoneLoadingMore || !_zoneHasMorePosts || !_zoneOldestPostAt) return;
+  _zoneLoadingMore = true;
+  const loadingEl = document.getElementById('zone-posts-loading-more');
+  if (loadingEl) loadingEl.style.display = 'block';
+  try {
+    const now = new Date().toISOString();
+    const { data } = await sbQuery('GET', 'channel_posts', null,
+      `?media_url=not.is.null&expires_at=gt.${now}&channel_id=neq.${AD_MASTER_CHANNEL_ID}` +
+      `&created_at=lt.${_zoneOldestPostAt}&select=*&order=created_at.desc&limit=${ZONE_DISCOVER_PAGE_SIZE}`);
+    const older = data || [];
+    _zoneHasMorePosts = older.length === ZONE_DISCOVER_PAGE_SIZE;
+    if (!older.length) return;
+    _zoneOldestPostAt = older[older.length - 1].created_at;
+    zoneDiscoverPosts = zoneDiscoverPosts.concat(older);
+
+    const missingChIds = [...new Set(older.map(p => p.channel_id))].filter(id => !zoneChannelById[id]);
+    if (missingChIds.length) {
+      const orClause = missingChIds.map(id => `id.eq.${id}`).join(',');
+      const { data: chRows } = await sbQuery('GET', 'channels', null, `?or=(${orClause})&select=*`);
+      (chRows || []).forEach(c => { zoneChannelById[c.id] = c; });
+    }
+    const postIds = older.map(p => p.id);
+    let likedSet = new Set();
+    if (postIds.length) {
+      const orClause = postIds.map(id => `post_id.eq.${id}`).join(',');
+      const { data: likeRows } = await sbQuery('GET', 'channel_post_likes', null,
+        `?or=(${orClause})&user_id=eq.${currentUser.id}&select=post_id`);
+      likedSet = new Set((likeRows || []).map(r => r.post_id));
+    }
+    const grid = document.getElementById('zone-posts-grid');
+    if (grid) grid.insertAdjacentHTML('beforeend', older.map(p => buildZonePostCardHtml(p, likedSet.has(p.id))).join(''));
+  } finally {
+    _zoneLoadingMore = false;
+    if (loadingEl) loadingEl.style.display = 'none';
+  }
+}
+
+// Always-visible Home/refresh button (fixed in place, unaffected by
+// scrolling) — tapping it is the ONLY trigger for pulling in newer posts.
+// No timers, no background checks. This just re-runs the normal fresh
+// load, then snaps back to the top — like tapping Facebook's home icon.
+async function refreshZoneHome() {
+  const btn = document.getElementById('zone-home-refresh-btn');
+  if (btn) btn.classList.add('spinning');
+  try {
+    await loadZoneDiscoverPosts();
+    const pane = document.getElementById('zone-scroll-pane');
+    if (pane) pane.scrollTo({ top: 0, behavior: 'smooth' });
+  } finally {
+    if (btn) setTimeout(() => btn.classList.remove('spinning'), 600);
+  }
 }
 
 // Shared card renderer — used by the main Discover feed and by hashtag
@@ -6092,6 +6322,7 @@ function updateChannelJoinRequestWordCount() {
 let _sendingChannelJoinRequest = false;
 async function handleSendChannelJoinRequest() {
   if (_sendingChannelJoinRequest || !activeChannel) return;
+  if (!navigator.onLine) { alert("You're offline — this needs an internet connection."); return; }
   const message = document.getElementById('channel-join-request-message').value.trim();
   const words = countWords(message);
   // Required, ~30 words — enforce a sane range rather than exactly 30 so
@@ -6541,6 +6772,7 @@ function onChannelPrivateToggle(checked) {
 let _creatingChannel = false;
 async function handleCreateChannel() {
   if (_creatingChannel) return;
+  if (!navigator.onLine) { alert("You're offline — this needs an internet connection."); return; }
   const name = document.getElementById('channel-name').value.trim();
   if (!name) { showError('err-create-channel', 'Please enter a channel name.'); return; }
   const about = document.getElementById('channel-about-input').value.trim() || null;
@@ -6829,6 +7061,7 @@ function updateFollowButtonUI() {
 
 async function toggleFollowChannel() {
   if (!activeChannel) return;
+  if (!navigator.onLine) { alert("You're offline — this needs an internet connection."); return; }
 
   // Private channels never follow directly — tapping the button opens the
   // join-request modal instead. A pending request is a no-op here (the
@@ -7085,6 +7318,7 @@ function updateChannelSubscribeSummary() {}
 let _subscribingChannel = false;
 async function handleSubscribeChannel() {
   if (_subscribingChannel || !activeChannel) return;
+  if (!navigator.onLine) { alert("You're offline — this needs an internet connection."); return; }
   const plan = document.querySelector('input[name="channel-sub-plan"]:checked').value;
   const priceNgn = plan === 'yearly' ? activeChannel.sub_price_yearly_ngn : activeChannel.sub_price_monthly_ngn;
   const errEl = document.getElementById('err-channel-subscribe');
@@ -7355,6 +7589,7 @@ async function refreshPostFeeds() {
 }
 
 async function toggleLikeChannelPost(postId, el) {
+  if (!navigator.onLine) { alert("You're offline — this needs an internet connection."); return; }
   const post = findChannelPost(postId);
   if (!post) return;
   const { data: existing } = await sbQuery('GET', 'channel_post_likes', null,
@@ -7654,6 +7889,7 @@ function renderChannelReplyBanner() {
 }
 
 async function submitChannelComment() {
+  if (!navigator.onLine) { alert("You're offline — this needs an internet connection."); return; }
   const input = document.getElementById('channel-comment-input');
   const body = input.value.trim();
   if (!body || !_activeCommentPostId) return;
@@ -7842,6 +8078,7 @@ function previewChannelPostMedia(input) {
 let _creatingChannelPost = false;
 async function handleCreateChannelPost(isPaid) {
   if (_creatingChannelPost || !activeChannel) return;
+  if (!navigator.onLine) { alert("You're offline — this needs an internet connection."); return; }
   if (activeChannel.is_snoozed) {
     showError('err-create-channel-post', 'Pay for maintenance before you use — this channel is snoozed until the ₦500 monthly fee is paid.');
     return;
@@ -14424,6 +14661,10 @@ async function doSupabaseLogin(email, password, errorElId) {
     // At this point profile.chat_code is always Sophia's real permanent code from Supabase.
 
     currentUser = { ...profile, email: authUser.email };
+    // Cache locally so the next app open can render straight into the chat
+    // space from disk (see restoreCachedSession) without waiting on a
+    // network round-trip first.
+    try { localStorage.setItem('dgreatverse-cached-profile', JSON.stringify(profile)); } catch (e) {}
 
     rememberAccount({ email: authUser.email, name: currentUser.name, avatar_url: currentUser.avatar_url || null });
     enterChatSpace();
