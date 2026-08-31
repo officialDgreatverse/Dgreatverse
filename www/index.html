@@ -3473,18 +3473,59 @@ function setupOfflineBanner() {
 setupOfflineBanner();
 
 // Once connectivity comes back while the app is already open and logged
-// in, quietly refresh everything (profile, contacts, groups, requests) so
-// the "online session" becomes fully live again — no user action needed.
-// Also re-attempts the session check itself, so a stale "session expired"
-// banner (possibly from a flaky connection rather than a truly dead
-// session) gets a fresh chance to quietly resolve itself.
+// in, quietly refresh everything relevant so nothing is left showing
+// stale/empty data from while we were offline — no user action needed.
+// This also re-attempts the session check itself, so a stale "session
+// expired" banner (possibly from a flaky connection rather than a truly
+// dead session) gets a fresh chance to quietly resolve itself.
 window.addEventListener('online', () => {
-  if (currentUser) refreshSessionInBackground();
-  const chatScreen = document.getElementById('screen-chat');
-  if (currentUser && chatScreen && chatScreen.classList.contains('active')) {
-    initChatSpace();
-  }
+  if (!currentUser) return;
+  refreshSessionInBackground();
+  resyncVisibleScreenOnReconnect();
 });
+
+// Refreshes whichever screen(s) the person is actually looking at right
+// now with live data, instead of leaving what was on screen while offline
+// (e.g. a cached-empty contacts list, a stale groups list, a Zone feed
+// frozen from before we lost connection) sitting there until they happen
+// to switch tabs or tap something. Everything here already has its own
+// try/catch or offline-guard internally, so a call failing here can't
+// break the others.
+function resyncVisibleScreenOnReconnect() {
+  const chatScreen = document.getElementById('screen-chat');
+  if (chatScreen && chatScreen.classList.contains('active')) {
+    // Contacts vs Groups tab — refresh whichever pane is actually showing.
+    const contactsPane = document.getElementById('contacts-pane');
+    if (contactsPane && contactsPane.classList.contains('tab-active')) {
+      loadContacts().catch(e => console.log('reconnect: loadContacts skipped', e));
+    } else {
+      loadGroups({ force: true }).catch(e => console.log('reconnect: loadGroups skipped', e));
+    }
+    loadPendingRequests().catch(e => console.log('reconnect: loadPendingRequests skipped', e));
+    loadGroupInvites().catch(e => console.log('reconnect: loadGroupInvites skipped', e));
+  }
+
+  const channelsScreen = document.getElementById('screen-channels');
+  if (channelsScreen && channelsScreen.classList.contains('active')) {
+    loadMyChannels().catch(e => console.log('reconnect: loadMyChannels skipped', e));
+    loadFollowedChannels().catch(e => console.log('reconnect: loadFollowedChannels skipped', e));
+  }
+
+  const channelViewScreen = document.getElementById('screen-channel-view');
+  if (channelViewScreen && channelViewScreen.classList.contains('active') && typeof renderChannelPosts === 'function') {
+    renderChannelPosts().catch(e => console.log('reconnect: renderChannelPosts skipped', e));
+  }
+
+  // Zone/Verse is deliberately manual-refresh-only during normal browsing
+  // (see openZoneScreen) — a tab switch shouldn't yank new posts in under
+  // someone's thumb. Coming back online after being offline is different:
+  // there's nothing on screen to disrupt, since it was already frozen on
+  // stale/cached content, so this is the one case it's safe to auto-sync.
+  const zoneScreen = document.getElementById('screen-zone');
+  if (zoneScreen && zoneScreen.classList.contains('active') && typeof refreshZoneHome === 'function') {
+    refreshZoneHome().catch(e => console.log('reconnect: refreshZoneHome skipped', e));
+  }
+}
 
 // ═══════════════════════════════════════
 // PRESENCE (Active / Offline status)
