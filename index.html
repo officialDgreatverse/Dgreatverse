@@ -8724,8 +8724,33 @@ document.addEventListener('visibilitychange', () => {
     joinPrivateMessagesRealtime();
     if (activeGroup) loadGroupMessages();
     if (activeChatContact) loadPrivateMessages();
+    // Also resync whatever list screen is showing (contacts/groups/channels/
+    // zone). This is the APK-safe path: the browser 'online' event doesn't
+    // reliably fire inside a Capacitor WebView, so leaving the "was I
+    // offline, did I just come back?" logic to that event alone left the
+    // contacts list stuck empty/stale even after reopening the app. Coming
+    // back to the foreground at all — regardless of whether 'online' fired —
+    // is the trigger here instead. loadContacts()/loadGroups() etc. already
+    // check navigator.onLine internally, so if we're still actually offline
+    // this is a harmless no-op that falls back to the cached list.
+    resyncVisibleScreenOnReconnect();
   }
 });
+
+// Second safety net for the APK specifically: some Android WebView versions
+// don't fire 'visibilitychange' reliably when the app is brought back from
+// the background (as opposed to just switching browser tabs, which is what
+// that event was really designed for). Capacitor's own App plugin fires a
+// native-level 'resume' event that doesn't have this problem, so we hook
+// that too when running inside the APK. No-ops harmlessly on the website,
+// where the plugin isn't present.
+(function setupCapacitorResumeSync() {
+  const AppPlugin = window.Capacitor && window.Capacitor.Plugins && window.Capacitor.Plugins.App;
+  if (!AppPlugin || !AppPlugin.addListener) return;
+  AppPlugin.addListener('resume', () => {
+    if (currentUser) resyncVisibleScreenOnReconnect();
+  });
+})();
 
 // Broadcast that a chat request was accepted — both sides update contacts instantly.
 function broadcastContactAccepted(accepterId, requesterId) {
