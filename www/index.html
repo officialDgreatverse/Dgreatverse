@@ -3484,6 +3484,21 @@ window.addEventListener('online', () => {
   resyncVisibleScreenOnReconnect();
 });
 
+// BACKUP TRIGGER for the APK/WebView build — the browser 'online' event
+// above is not reliable inside an Android WebView (it can simply never
+// fire even though the device is genuinely connected), and neither is
+// navigator.onLine as a gate (see sbQuery). So whenever the app comes back
+// to the foreground — reopened from the app switcher, unlocked, etc. — we
+// also resync, since every loader now trusts the real fetch result rather
+// than a possibly-stale connectivity flag, this is safe to call every time
+// and simply no-ops quickly if a screen has nothing new.
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState !== 'visible') return;
+  if (!currentUser) return;
+  refreshSessionInBackground();
+  resyncVisibleScreenOnReconnect();
+});
+
 // Refreshes whichever screen(s) the person is actually looking at right
 // now with live data, instead of leaving what was on screen while offline
 // (e.g. a cached-empty contacts list, a stale groups list, a Zone feed
@@ -3869,12 +3884,16 @@ function cacheLoad(name) {
 }
 
 async function sbQuery(method, table, body = null, filters = '') {
-  // Offline — don't even attempt the request. Every caller already
-  // expects `data` to possibly be null/empty, so this fails the same way
-  // a real network error would, just instantly instead of after a timeout.
-  if (!navigator.onLine) {
-    return { data: null, ok: false, status: 0, offline: true };
-  }
+  // NOTE: we deliberately do NOT pre-check navigator.onLine here anymore.
+  // navigator.onLine is unreliable inside an Android WebView (the shell the
+  // APK runs in) — it can get stuck reporting `false` on cold start or after
+  // the app resumes from the background even though the device has a fine
+  // Wi-Fi/data connection, and the WebView doesn't always fire the 'online'
+  // event to correct itself later. Gating every request on that flag meant
+  // the app could silently believe it was offline forever, even while truly
+  // online, with nothing to snap it out of it. Instead we always attempt the
+  // real request and let the request's own outcome (success, HTTP error, or
+  // network failure/timeout below) be the actual source of truth.
   const url = `${SUPABASE_URL}/rest/v1/${table}${filters}`;
   const token = await getFreshToken();
   const headers = {
@@ -3894,9 +3913,15 @@ async function sbQuery(method, table, body = null, filters = '') {
   let res;
   try {
     res = await fetch(url, { method, headers, body: body ? JSON.stringify(body) : null, signal: controller.signal });
-  } finally {
+  } catch (networkErr) {
+    // Real network failure (or our own 7s timeout aborting it) — THIS is
+    // the trustworthy offline signal, not navigator.onLine. Every caller
+    // already expects `data` to possibly be null and checks `offline`/`ok`
+    // to fall back to its cache, so this fails the same shape as before.
     clearTimeout(timeoutId);
+    return { data: null, ok: false, status: 0, offline: true };
   }
+  clearTimeout(timeoutId);
 
   let data = null;
   const text = await res.text();
@@ -4813,9 +4838,14 @@ const lastSeenMap = {};
 // legacy alias so existing badge code still works
 const unreadMap = {};
 async function loadContacts() {
-  // Offline — skip the network entirely and show whatever contact list
-  // (with last-message times) we saved from the last time we were online.
-  if (!navigator.onLine) {
+  // Fetch all rows where current user is involved. We always attempt this
+  // live — navigator.onLine is not trusted as a gate (see sbQuery) — and
+  // only fall back to the last cached contact list if the request itself
+  // genuinely fails (sbQuery returns offline:true).
+  const { data: rows, offline } = await sbQuery('GET', 'contacts', null,
+    `?or=(user_id.eq.${currentUser.id},contact_id.eq.${currentUser.id})&select=user_id,contact_id`);
+
+  if (offline) {
     const cached = cacheLoad('contacts');
     if (Array.isArray(cached)) {
       myContacts = cached;
@@ -4824,10 +4854,6 @@ async function loadContacts() {
     }
     return;
   }
-
-  // Fetch all rows where current user is involved
-  const { data: rows } = await sbQuery('GET', 'contacts', null,
-    `?or=(user_id.eq.${currentUser.id},contact_id.eq.${currentUser.id})&select=user_id,contact_id`);
 
   if (!Array.isArray(rows) || rows.length === 0) {
     myContacts = [];
@@ -5391,8 +5417,12 @@ const groupMeta = {};
 async function loadGroups(opts) {
   const force = opts && opts.force; // pass {force:true} for a true fresh-login load
 
-  // Offline — skip the network and show the last groups list we cached.
-  if (!navigator.onLine) {
+  // Always attempt the live request first; only fall back to the cached
+  // groups list if it genuinely fails (see sbQuery — navigator.onLine is
+  // not trusted as a gate anymore).
+  const { data: memberRows, offline } = await sbQuery('GET', 'group_members', null,
+    `?user_id=eq.${currentUser.id}&select=group_id`);
+  if (offline) {
     const cached = cacheLoad('groups');
     if (Array.isArray(cached)) {
       myGroups = cached;
@@ -5401,9 +5431,6 @@ async function loadGroups(opts) {
     }
     return;
   }
-
-  const { data: memberRows } = await sbQuery('GET', 'group_members', null,
-    `?user_id=eq.${currentUser.id}&select=group_id`);
   if (!Array.isArray(memberRows) || !memberRows.length) { myGroups = []; renderGroups(); cacheSave('groups', myGroups); return; }
   const gids = memberRows.map(r => `id.eq.${r.group_id}`).join(',');
   const { data: groups } = await sbQuery('GET', 'groups', null, `?or=(${gids})&select=*,about,msg_permission`);
@@ -5531,15 +5558,15 @@ function updateGroupNotifDot() {
 // ═══════════════════════════════════════
 
 async function loadCommunities() {
-  if (!navigator.onLine) {
+  // A user "has" a community if they created it, or if they belong to any
+  // group that lives inside it.
+  const { data: memberGroupRows, offline } = await sbQuery('GET', 'group_members', null,
+    `?user_id=eq.${currentUser.id}&select=group_id`);
+  if (offline) {
     const cached = cacheLoad('communities');
     if (Array.isArray(cached)) { myCommunities = cached; renderCommunities(); }
     return;
   }
-  // A user "has" a community if they created it, or if they belong to any
-  // group that lives inside it.
-  const { data: memberGroupRows } = await sbQuery('GET', 'group_members', null,
-    `?user_id=eq.${currentUser.id}&select=group_id`);
   const gids = Array.isArray(memberGroupRows) ? memberGroupRows.map(r => r.group_id) : [];
 
   let communityIdsFromGroups = [];
@@ -10518,23 +10545,24 @@ async function loadPrivateMessages() {
   if (!activeChatContact) return;
   const myId = currentUser.id, theirId = activeChatContact.id;
 
-  // Offline — show the last messages we cached for this conversation.
-  // Read-only: no read-receipts or contact re-sort, since both need the network.
-  if (!navigator.onLine) {
-    const cached = cacheLoad('privmsgs_' + theirId);
-    renderPrivateMessages(Array.isArray(cached) ? cached : []);
-    return;
-  }
-
   // Update lastSeen to now since user is viewing this chat
   lastSeenMap[theirId] = new Date().toISOString();
-  const [{ data }, { data: hiddenRows }, { data: theirReadRows }] = await Promise.all([
+  const [{ data, offline }, { data: hiddenRows }, { data: theirReadRows }] = await Promise.all([
     sbQuery('GET','messages',null,
       `?or=(and(sender_id.eq.${myId},receiver_id.eq.${theirId}),and(sender_id.eq.${theirId},receiver_id.eq.${myId}))&order=created_at.asc&select=*`),
     sbQuery('GET','hidden_messages',null,`?owner_id=eq.${myId}&select=message_id`),
     // How far THEY have read into messages I sent them — drives the status dot.
     sbQuery('GET','private_reads',null,`?user_id=eq.${theirId}&contact_id=eq.${myId}&select=last_read_at`)
   ]);
+
+  // Genuine network failure — show the last messages we cached for this
+  // conversation instead. Read-only: no read-receipts or contact re-sort,
+  // since both need the network.
+  if (offline) {
+    const cached = cacheLoad('privmsgs_' + theirId);
+    renderPrivateMessages(Array.isArray(cached) ? cached : []);
+    return;
+  }
   if (!Array.isArray(data)) return;
   const now = Date.now();
   const clearedBefore = (contactSettingsMap[theirId] && contactSettingsMap[theirId].cleared_before)
@@ -10785,17 +10813,17 @@ function closeGroupChat() {
 async function loadGroupMessages() {
   if (!activeGroup) return;
 
-  // Offline — show the last messages we cached for this group.
-  // Read-only: polls/votes need the network, so those are skipped offline.
-  if (!navigator.onLine) {
+  const { data, offline } = await sbQuery('GET','group_messages',null,
+    `?group_id=eq.${activeGroup.id}&order=created_at.asc&select=*`);
+
+  // Genuine network failure — show the last messages we cached for this
+  // group. Read-only: polls/votes need the network, so those are skipped.
+  if (offline) {
     const cached = cacheLoad('groupmsgs_' + activeGroup.id);
     const cachedSenders = cacheLoad('groupsenders_' + activeGroup.id) || {};
     renderGroupMessages(Array.isArray(cached) ? cached : [], cachedSenders, {}, {}, {}, []);
     return;
   }
-
-  const { data } = await sbQuery('GET','group_messages',null,
-    `?group_id=eq.${activeGroup.id}&order=created_at.asc&select=*`);
   if (!Array.isArray(data)) return;
 
   const paidMsgIds = data.filter(m => m.price_dg > 0).map(m => m.id);
