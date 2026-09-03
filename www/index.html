@@ -12,6 +12,32 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8" />
+<style>
+  /*
+    Cycle: visible for 10s, hidden for 60s, repeat forever (70s total).
+    Pure CSS animation on a fixed-position timer — no setInterval polling,
+    no network calls, nothing checking a server. It just toggles opacity
+    on a clock, entirely in the browser.
+  */
+  #dgv-download-fab {
+    position: fixed; bottom: 18px; right: 14px; z-index: 99999;
+    display: flex; align-items: center; gap: 5px;
+    background: linear-gradient(135deg, #7b2fff, #a855f7);
+    color: #fff; font-family: 'Inter', sans-serif; font-size: 12px; font-weight: 600;
+    padding: 8px 12px; border-radius: 999px; text-decoration: none;
+    box-shadow: 0 4px 16px rgba(123,47,255,0.5);
+    opacity: 0; visibility: hidden; pointer-events: none;
+    transition: opacity 0.4s ease;
+    animation: dgv-fab-cycle 70s ease-in-out infinite;
+  }
+  #dgv-download-fab svg { width: 14px; height: 14px; flex-shrink: 0; }
+  @keyframes dgv-fab-cycle {
+    0%     { opacity: 1; visibility: visible; pointer-events: auto; }
+    14%    { opacity: 1; visibility: visible; pointer-events: auto; }
+    14.5%  { opacity: 0; visibility: hidden;  pointer-events: none; }
+    100%   { opacity: 0; visibility: hidden;  pointer-events: none; }
+  }
+</style>
 <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
 <title>Dgreatverse</title>
 
@@ -1652,6 +1678,10 @@
 </style>
 </head>
 <body>
+<a id="dgv-download-fab" href="app-release.apk" download="DgreatVerse.apk">
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12m0 0l-4-4m4 4l4-4M4 21h16"/></svg>
+  Download App
+</a>
 <!-- SPLASH SCREEN — shown instantly on load, hides the login-screen flash
      while tryAutoLogin() checks the session. Removed in JS once we know
      whether to show login or jump straight to the ad/chat space. -->
@@ -1675,17 +1705,7 @@
   You're offline — showing your last saved chats. Messages will send once you're back online.
 </div>
 
-<!-- SESSION-EXPIRED BANNER — only shown if a long-idle device (e.g. app not
-     opened for many days) comes back online and Supabase reports the saved
-     session is no longer valid. We don't auto-kick the person out of what's
-     on screen (see refreshSessionInBackground) — this just lets them know
-     a fresh login is needed to send/receive anything new. -->
-<div id="session-expired-banner" style="display:none;position:fixed;top:0;left:0;right:0;z-index:9998;
-  background:#5c1a1a;color:#ffd8d8;text-align:center;font-size:12px;font-weight:600;
-  letter-spacing:0.3px;padding:7px 10px;box-shadow:0 2px 10px rgba(0,0,0,0.3);cursor:pointer;"
-  onclick="logout()">
-  Your session has expired — tap here to log in again
-</div>
+
 
 <div class="app-wrapper" id="auth-wrapper" style="display:none;">
   <!-- About button fixed top-right on auth screens -->
@@ -3313,7 +3333,11 @@ async function tryAutoLogin() {
     // changes here — that still requires a live connection and is blocked
     // elsewhere (see the navigator.onLine checks on send actions).
     if (restoreCachedSession()) {
-      if (navigator.onLine) refreshSessionInBackground();
+      // No proactive session check here anymore — the cached session is
+      // trusted as-is. Supabase's own client still refreshes the access
+      // token automatically, lazily, the moment any real request is made
+      // (see getFreshToken/sbQuery) — that's "Supabase directly," and it
+      // never logs anyone out just from time passing.
       return true;
     }
 
@@ -3368,64 +3392,6 @@ async function tryAutoLogin() {
   }
 }
 
-// Once the cache-first restore above has already put the person into the
-// chat space instantly, this quietly re-verifies the session and refreshes
-// the profile over the network — same network calls the old blocking path
-// used to make BEFORE showing anything, just moved to run silently after.
-// If the session turns out to be genuinely invalid (e.g. revoked, password
-// changed elsewhere), we deliberately do nothing drastic here — the person
-// stays in with what's cached rather than getting yanked back to a login
-// screen mid-session; the next explicit logout/login will resolve it.
-async function refreshSessionInBackground(_isRetry) {
-  try {
-    const { data: sessionData } = await sbRealtime.auth.getSession();
-    const session = sessionData && sessionData.session;
-    if (!session) {
-      // Don't declare the session dead off a single empty result — that can
-      // happen from a one-off flaky request, not just a genuinely invalid
-      // refresh token. Give it one more real attempt a few seconds later
-      // before showing anything to the person.
-      if (!_isRetry) {
-        setTimeout(() => refreshSessionInBackground(true), 4000);
-        return;
-      }
-      // Confirmed on a second try, with network available both times —
-      // this really is a dead session (e.g. revoked, password changed
-      // elsewhere), not a connectivity blip. There's no way to silently
-      // recover this without storing the password on the device, which we
-      // deliberately never do. Let the person know, without disturbing
-      // whatever they're already looking at.
-      const banner = document.getElementById('session-expired-banner');
-      if (banner) banner.style.display = 'block';
-      return;
-    }
-
-    // Success — make sure any stale expired-banner from an earlier failed
-    // attempt is cleared now that we're confirmed good again.
-    const banner = document.getElementById('session-expired-banner');
-    if (banner) banner.style.display = 'none';
-
-    currentAccessToken = session.access_token;
-    const authUser = session.user;
-
-    const { data: rows } = await sbQuery('GET', 'users', null,
-      `?id=eq.${authUser.id}&select=id,name,email,chat_code,avatar_url,avatar_public_id,about,is_vip,vip_expires_at`);
-    const profile = rows && rows[0];
-    if (!profile) return;
-
-    localStorage.setItem('dgreatverse-cached-profile', JSON.stringify(profile));
-    currentUser = { ...profile, email: authUser.email };
-    if (currentUser.avatar_url) _applyAvatar(currentUser.avatar_url);
-    const codeEl = document.getElementById('display-chat-code');
-    if (codeEl) codeEl.textContent = currentUser.chat_code || '—';
-  } catch (e) {
-    // Threw outright — a real network failure, not Supabase telling us the
-    // session is invalid. Leave everything as-is; the 'online' listener
-    // below will naturally trigger another attempt once connectivity is
-    // actually back.
-  }
-}
-
 // Cache-first session restore — reads the session Supabase already
 // persisted to localStorage (from the last time this device logged in
 // successfully) plus the profile we cached at that same time, and drops
@@ -3475,12 +3441,8 @@ setupOfflineBanner();
 // Once connectivity comes back while the app is already open and logged
 // in, quietly refresh everything relevant so nothing is left showing
 // stale/empty data from while we were offline — no user action needed.
-// This also re-attempts the session check itself, so a stale "session
-// expired" banner (possibly from a flaky connection rather than a truly
-// dead session) gets a fresh chance to quietly resolve itself.
 window.addEventListener('online', () => {
   if (!currentUser) return;
-  refreshSessionInBackground();
   resyncVisibleScreenOnReconnect();
 });
 
@@ -3495,7 +3457,6 @@ window.addEventListener('online', () => {
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState !== 'visible') return;
   if (!currentUser) return;
-  refreshSessionInBackground();
   resyncVisibleScreenOnReconnect();
 });
 
@@ -3507,21 +3468,25 @@ document.addEventListener('visibilitychange', () => {
 // try/catch or offline-guard internally, so a call failing here can't
 // break the others.
 function resyncVisibleScreenOnReconnect() {
+  // NOTE: we deliberately refresh BOTH the Contacts and Groups pane here,
+  // not just whichever one happens to be on screen right now. This still
+  // only runs once, off the 'online'/visibilitychange events — no polling —
+  // but before this fix, only the pane visible at the exact moment we came
+  // back online got refreshed. The other pane kept showing whatever was
+  // last rendered (often blank, if it was never loaded while offline) and
+  // stayed that way until something else forced a reload, since switching
+  // tabs only re-renders from memory (see switchChatTab) rather than
+  // fetching fresh data. Same reasoning applies to channels below.
   const chatScreen = document.getElementById('screen-chat');
-  if (chatScreen && chatScreen.classList.contains('active')) {
-    // Contacts vs Groups tab — refresh whichever pane is actually showing.
-    const contactsPane = document.getElementById('contacts-pane');
-    if (contactsPane && contactsPane.classList.contains('tab-active')) {
-      loadContacts().catch(e => console.log('reconnect: loadContacts skipped', e));
-    } else {
-      loadGroups({ force: true }).catch(e => console.log('reconnect: loadGroups skipped', e));
-    }
+  if (chatScreen) {
+    loadContacts().catch(e => console.log('reconnect: loadContacts skipped', e));
+    loadGroups({ force: true }).catch(e => console.log('reconnect: loadGroups skipped', e));
     loadPendingRequests().catch(e => console.log('reconnect: loadPendingRequests skipped', e));
     loadGroupInvites().catch(e => console.log('reconnect: loadGroupInvites skipped', e));
   }
 
   const channelsScreen = document.getElementById('screen-channels');
-  if (channelsScreen && channelsScreen.classList.contains('active')) {
+  if (channelsScreen) {
     loadMyChannels().catch(e => console.log('reconnect: loadMyChannels skipped', e));
     loadFollowedChannels().catch(e => console.log('reconnect: loadFollowedChannels skipped', e));
   }
@@ -3529,6 +3494,25 @@ function resyncVisibleScreenOnReconnect() {
   const channelViewScreen = document.getElementById('screen-channel-view');
   if (channelViewScreen && channelViewScreen.classList.contains('active') && typeof renderChannelPosts === 'function') {
     renderChannelPosts().catch(e => console.log('reconnect: renderChannelPosts skipped', e));
+  }
+
+  // An open one-on-one chat has its own message list that the fixes above
+  // don't touch at all — it's neither the contacts pane nor the groups
+  // pane, it's a separate screen you're inside of. Without this, being
+  // offline while sitting in a conversation left the message list frozen
+  // (or blank, if it hadn't loaded yet) even after connectivity came back,
+  // since nothing was telling it to re-fetch. Gated on the screen actually
+  // being open (not just present in the DOM) because there's no "current
+  // conversation" to reload otherwise.
+  const privateChatScreen = document.getElementById('screen-private-chat');
+  if (privateChatScreen && privateChatScreen.classList.contains('active') && activeChatContact) {
+    loadPrivateMessages().catch(e => console.log('reconnect: loadPrivateMessages skipped', e));
+  }
+
+  // Same gap, same fix, for an open group chat.
+  const groupChatScreen = document.getElementById('screen-group-chat');
+  if (groupChatScreen && groupChatScreen.classList.contains('active') && activeGroup) {
+    loadGroupMessages().catch(e => console.log('reconnect: loadGroupMessages skipped', e));
   }
 
   // Zone/Verse is deliberately manual-refresh-only during normal browsing
@@ -4195,7 +4179,7 @@ async function sendSticker(url) {
     const body = { sender_id: currentUser.id, receiver_id: activeChatContact.id, file_url: url, file_type: 'sticker' };
     if (mySettings.disappear_seconds) body.expires_at = new Date(Date.now() + mySettings.disappear_seconds * 1000).toISOString();
     const result = await sbQuery('POST', 'messages', body);
-    if (!result.ok) { alert('SEND FAILED: ' + result.status + ' — ' + JSON.stringify(result.data)); return; }
+    if (!result.ok) { alert('Send failed — try logging in again.'); return; }
     broadcastPrivateMessageSent(activeChatContact.id);
     await loadPrivateMessages();
     const area = document.getElementById('private-messages-area');
@@ -8779,6 +8763,75 @@ document.addEventListener('visibilitychange', () => {
   });
 })();
 
+// ── UPDATE CHECKER ──────────────────────────────────────────────────────
+// Polls version.json (hosted alongside the APK) and compares its versionCode
+// against the installed app's own versionCode (via Capacitor's App plugin).
+// If a newer release exists, shows a small dismissible banner with a link
+// to download it. No-ops harmlessly on the website / outside the APK.
+const VERSION_CHECK_URL = 'https://officialdgreatverse.github.io/Dgreatverse/version.json';
+
+async function checkForAppUpdate() {
+  try {
+    const AppPlugin = window.Capacitor && window.Capacitor.Plugins && window.Capacitor.Plugins.App;
+    const isNative = window.Capacitor && window.Capacitor.isNativePlatform && window.Capacitor.isNativePlatform();
+    if (!AppPlugin || !isNative) return; // only relevant inside the installed APK
+
+    const info = await AppPlugin.getInfo(); // { version, build, ... } — build is versionCode as a string
+    const installedVersionCode = parseInt(info.build, 10);
+    if (!installedVersionCode) return;
+
+    // Cache-bust so GitHub Pages / the WebView never serves a stale manifest.
+    const res = await fetch(`${VERSION_CHECK_URL}?t=${Date.now()}`, { cache: 'no-store' });
+    if (!res.ok) return;
+    const remote = await res.json();
+    if (!remote || !remote.versionCode || !remote.apkUrl) return;
+
+    if (remote.versionCode > installedVersionCode) {
+      showUpdateBanner(remote);
+    }
+  } catch (err) {
+    // Silent fail — a broken update check should never block the app.
+    console.warn('Update check failed:', err);
+  }
+}
+
+function showUpdateBanner(remote) {
+  if (document.getElementById('dgv-update-banner')) return; // already showing
+  const banner = document.createElement('div');
+  banner.id = 'dgv-update-banner';
+  banner.style.cssText = `
+    position: fixed; left: 12px; right: 12px; bottom: 84px; z-index: 9999;
+    background: linear-gradient(90deg, rgba(168,85,247,0.95), rgba(123,47,255,0.95));
+    color: #fff; border-radius: 14px; padding: 12px 14px;
+    display: flex; align-items: center; gap: 10px;
+    box-shadow: 0 6px 24px rgba(0,0,0,0.4); font-family: Inter, sans-serif;
+  `;
+  banner.innerHTML = `
+    <div style="flex:1; min-width:0;">
+      <div style="font-size:13px; font-weight:700;">Update available${remote.versionName ? ' — v' + remote.versionName : ''}</div>
+      <div style="font-size:11.5px; opacity:0.9; margin-top:2px;">${remote.notes ? remote.notes : 'A new version of Dgreatverse is ready.'}</div>
+    </div>
+    <button id="dgv-update-btn" style="flex-shrink:0; background:#fff; color:#7b2fff; border:none; border-radius:10px; padding:8px 12px; font-weight:700; font-size:12.5px; cursor:pointer;">Update</button>
+    <button id="dgv-update-dismiss" style="flex-shrink:0; background:transparent; color:#fff; border:none; font-size:16px; cursor:pointer; padding:4px;">✕</button>
+  `;
+  document.body.appendChild(banner);
+
+  document.getElementById('dgv-update-btn').onclick = () => {
+    window.open(remote.apkUrl, '_blank');
+  };
+  document.getElementById('dgv-update-dismiss').onclick = () => {
+    banner.remove();
+  };
+}
+
+// Check on load, and again whenever the app resumes from background.
+checkForAppUpdate();
+(function setupUpdateCheckOnResume() {
+  const AppPlugin = window.Capacitor && window.Capacitor.Plugins && window.Capacitor.Plugins.App;
+  if (!AppPlugin || !AppPlugin.addListener) return;
+  AppPlugin.addListener('resume', checkForAppUpdate);
+})();
+
 // Broadcast that a chat request was accepted — both sides update contacts instantly.
 function broadcastContactAccepted(accepterId, requesterId) {
   if (!contactsRealtimeChannel) return;
@@ -10720,7 +10773,7 @@ async function sendPrivateMessage() {
   }  if (activeReply.private) body.reply_to_id = activeReply.private.msgId;
   const result = await sbQuery('POST','messages', body);
   if (!result.ok) {
-    alert('SEND FAILED: ' + result.status + ' — ' + JSON.stringify(result.data));
+    alert('Send failed — try logging in again.');
   }
   clearReply('private');
   broadcastPrivateMessageSent(activeChatContact.id);
