@@ -1,5 +1,10 @@
 {
   "appId": "com.dgreat.dgreatverse",
   "appName": "DgreatVerse",
-  "webDir": "www"
+  "webDir": "www",
+  "server": {
+    "url": "https://officialdgreatverse.github.io/Dgreatverse/",
+    "androidScheme": "https",
+    "cleartext": false
+  }
 }
