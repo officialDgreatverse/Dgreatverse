@@ -1,10 +1,10 @@
 apply plugin: 'com.android.application'
 
 android {
-    namespace "com.freddie.dgreatverse"
+    namespace "com.dgreat.dgreatverse"
     compileSdk rootProject.ext.compileSdkVersion
     defaultConfig {
-        applicationId "com.freddie.dgreatverse"
+        applicationId "com.dgreat.dgreatverse"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
         versionCode 2
