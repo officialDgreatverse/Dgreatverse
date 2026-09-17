@@ -1,4 +1,4 @@
-package com.freddie.dgreatverse;
+package com.dgreat.dgreatverse;
 
 import com.getcapacitor.BridgeActivity;
 
