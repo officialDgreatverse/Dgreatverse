@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "513875607066",
+    "project_id": "dgreatverse-6f2fb",
+    "storage_bucket": "dgreatverse-6f2fb.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:513875607066:android:9e8ac15fad06cc74509ba3",
+        "android_client_info": {
+          "package_name": "com.dgreat.dgreatverse"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyA4A3JIwVcz928XlCXS8vnamJMmRPaERnU"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
