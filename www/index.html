@@ -2541,6 +2541,10 @@
       <div id="empty-zone-posts-hint" style="display:none;text-align:center;color:var(--text-muted);font-size:12px;padding:24px 14px;">
         No posts yet.
       </div>
+      <div id="zone-no-connection-hint" style="display:none;text-align:center;color:var(--text-muted);font-size:12px;padding:24px 14px;">
+        No connection — channels are live-only and don't show saved/old content.<br>
+        <button type="button" onclick="loadZoneChannels()" style="margin-top:10px;background:rgba(var(--purple-glow-rgb),0.15);border:1px solid rgba(var(--purple-glow-rgb),0.35);color:var(--gold-light,#DCE6F5);border-radius:14px;padding:6px 16px;font-size:12px;font-weight:600;cursor:pointer;">Try Again</button>
+      </div>
     </div>
     <!-- Hashtag feed — tap any #tag in a caption or the trending strip -->
     <div id="zone-tag-feed-view" style="display:none;">
@@ -5285,6 +5289,7 @@ async function initChatSpace() {
   try { joinContactsRealtime(); } catch (e) { console.log('joinContactsRealtime skipped:', e); }
   try { startStickerRealtimeWatch(); } catch (e) { console.log('startStickerRealtimeWatch skipped:', e); }
   try { joinTipsRealtime(); } catch (e) { console.log('joinTipsRealtime skipped:', e); }
+  try { registerNativePush(); } catch (e) { console.log('registerNativePush skipped:', e); }
   // Also check right now (covers stickers uploaded while logged out/offline,
   // which a live realtime subscription wouldn't have caught retroactively).
   loadStickerCache(true).catch(e => console.log('sticker badge check skipped:', e));
@@ -6611,32 +6616,16 @@ function closeChannelsScreen() {
 }
 
 // ═══ ZONE — discovery feed: search & browse every public channel ═══
-// Loaded exactly once per app session (first time the tab is opened, or
-// after a full app reload). Switching to another tab and back must NOT
-// pull in newer posts — only the Home/refresh button (or leaving and
-// reopening the app) is allowed to do that.
-let _zoneInitialLoadDone = false;
+// Channels are real-time, not cached: every time this screen is opened it
+// does a fresh live fetch. If that fetch fails (no connection), we show an
+// honest "No connection" state instead of any saved/stale content — no
+// offline fallback, no auto-polling. The only way to load again after that
+// is the explicit Refresh button or the "Try Again" button in that state.
 function openZoneScreen() {
   document.getElementById('screen-zone').classList.add('active');
   document.getElementById('zone-search-input').value = '';
   filterZoneChannels('');
-  if (!_zoneInitialLoadDone) {
-    _zoneInitialLoadDone = true;
-    // Same cache-first pattern as Contacts: paint whatever was cached from
-    // last time INSTANTLY, before any network call, so opening Verse never
-    // shows a blank screen while the live fetch is in flight.
-    const cachedTrending = cacheLoad('zoneTrending');
-    const cachedAll = cacheLoad('zoneAllChannels');
-    const cachedPosts = cacheLoad('zoneDiscoverPosts');
-    if (Array.isArray(cachedTrending) && cachedTrending.length) { zoneTrendingChannels = cachedTrending; renderZoneTrending(); }
-    if (Array.isArray(cachedAll)) { allZoneChannels = cachedAll; cachedAll.forEach(c => { zoneChannelById[c.id] = c; }); }
-    if (Array.isArray(cachedPosts) && cachedPosts.length) {
-      zoneDiscoverPosts = cachedPosts;
-      _zoneOldestPostAt = cachedPosts[cachedPosts.length - 1].created_at;
-      renderZoneDiscoverPosts();
-    }
-    loadZoneChannels();
-  }
+  loadZoneChannels();
 }
 function closeZoneScreen() {
   document.getElementById('screen-zone').classList.remove('active');
@@ -6653,38 +6642,41 @@ function onZoneScroll() {
 }
 
 async function loadZoneChannels() {
+  const noConn = document.getElementById('zone-no-connection-hint');
   const [trendingRes, allRes] = await Promise.all([
     sbQuery('GET', 'channels', null, `?select=*&order=follower_count.desc.nullslast&limit=5`),
     sbQuery('GET', 'channels', null, `?select=*&order=created_at.desc`),
   ]);
-  // Never overwrite what's already showing with an empty list just because
-  // this particular fetch failed — offline/timeout returns data:null, and
-  // blindly doing `data || []` here used to wipe the whole Trending row
-  // (and channel search) on any hiccup instead of leaving it as-is.
-  if (trendingRes.offline || !Array.isArray(trendingRes.data)) {
-    if (!zoneTrendingChannels.length) {
-      const cached = cacheLoad('zoneTrending');
-      if (Array.isArray(cached) && cached.length) { zoneTrendingChannels = cached; renderZoneTrending(); }
-    }
-  } else {
+  const trendingOk = !trendingRes.offline && Array.isArray(trendingRes.data);
+  const allOk = !allRes.offline && Array.isArray(allRes.data);
+
+  if (trendingOk) {
     zoneTrendingChannels = trendingRes.data;
-    cacheSave('zoneTrending', zoneTrendingChannels);
     renderZoneTrending();
   }
-  if (allRes.offline || !Array.isArray(allRes.data)) {
-    if (!allZoneChannels.length) {
-      const cached = cacheLoad('zoneAllChannels');
-      if (Array.isArray(cached) && cached.length) { allZoneChannels = cached; cached.forEach(c => { zoneChannelById[c.id] = c; }); }
-    }
-  } else {
+  if (allOk) {
     allZoneChannels = allRes.data;
-    cacheSave('zoneAllChannels', allZoneChannels);
+    zoneChannelById = {};
+    allZoneChannels.forEach(c => { zoneChannelById[c.id] = c; });
   }
+
   const postsOk = await loadZoneDiscoverPosts();
-  // Report whether we actually got anything live, so callers (the Refresh
-  // button) can give honest feedback instead of guessing from
-  // navigator.onLine, which this app already treats as unreliable elsewhere.
-  return postsOk && !trendingRes.offline && !allRes.offline;
+  const gotLiveData = postsOk && trendingOk && allOk;
+
+  // Channels are live-only — a failed fetch means nothing trustworthy to
+  // show, so clear whatever's on screen and surface an honest "no
+  // connection" state instead of leaving stale content up.
+  if (!gotLiveData && !zoneDiscoverPosts.length) {
+    const grid = document.getElementById('zone-posts-grid');
+    const emptyHint = document.getElementById('empty-zone-posts-hint');
+    if (grid) grid.innerHTML = '';
+    if (emptyHint) emptyHint.style.display = 'none';
+    if (noConn) noConn.style.display = 'block';
+  } else if (noConn) {
+    noConn.style.display = 'none';
+  }
+
+  return gotLiveData;
 }
 
 function renderZoneTrending() {
@@ -6717,24 +6709,13 @@ async function loadZoneDiscoverPosts() {
   const { data, offline } = await sbQuery('GET', 'channel_posts_secure', null,
     `?has_media=eq.true&expires_at=gt.${now}&channel_id=neq.${AD_MASTER_CHANNEL_ID}&select=*&order=created_at.desc&limit=${ZONE_DISCOVER_PAGE_SIZE}`);
   if (offline || !Array.isArray(data)) {
-    // Fetch failed — leave whatever's currently on screen exactly as-is
-    // (it's either already-live content, or the cache openZoneScreen()
-    // painted in). Only reach for the cache here if nothing is showing at
-    // all yet (e.g. this got called before the cache-first paint ran).
-    if (!zoneDiscoverPosts.length) {
-      const cached = cacheLoad('zoneDiscoverPosts');
-      if (Array.isArray(cached) && cached.length) {
-        zoneDiscoverPosts = cached;
-        _zoneOldestPostAt = cached[cached.length - 1].created_at;
-        _zoneHasMorePosts = false; // don't try to paginate further on a cached snapshot
-        allZoneChannels.forEach(c => { zoneChannelById[c.id] = c; });
-        await renderZoneDiscoverPosts();
-      }
-    }
+    // Fetch failed — channels are live-only, no offline fallback. Leave the
+    // decision of what to show (existing content vs. "no connection") to
+    // the caller (loadZoneChannels), which knows the full picture across
+    // trending/all-channels/posts.
     return false;
   }
   zoneDiscoverPosts = data;
-  cacheSave('zoneDiscoverPosts', zoneDiscoverPosts);
   // Reset the pagination cursor to this fresh load.
   _zoneOldestPostAt = zoneDiscoverPosts.length ? zoneDiscoverPosts[zoneDiscoverPosts.length - 1].created_at : null;
   _zoneHasMorePosts = zoneDiscoverPosts.length === ZONE_DISCOVER_PAGE_SIZE;
@@ -7975,6 +7956,11 @@ async function openChannelScreen(channelId, origin) {
   document.getElementById('screen-channels').classList.remove('active');
   document.getElementById('screen-zone').classList.remove('active');
   document.getElementById('screen-channel-view').classList.add('active');
+  // Channels are live-only, per-channel — never let the previous channel's
+  // posts linger on screen (or count as "already loaded") while this one's
+  // fresh fetch is in flight or if it fails.
+  _channelPosts = [];
+  document.getElementById('channel-posts-feed').innerHTML = '';
   await loadChannelPosts(channelId);
 }
 
@@ -10113,7 +10099,9 @@ function joinGroupMessagesRealtime() {
       // that one message's reaction chip, no full reload.
       if (activeGroup) loadReactions(p.message_id, 'group');
     })
-    .subscribe((status) => {
+    .subscribe((status, err) => {
+      // TEMP DEBUG — remove once new-messages bug is confirmed fixed.
+      console.log('[dg-realtime] group-notify status:', status, err || '');
       // Same fix as contacts-notify: mobile sockets drop silently on
       // lock/background/weak signal. Rejoin once on an actual disconnect —
       // event-driven, not a timer/polling loop.
@@ -10247,7 +10235,9 @@ function joinPrivateMessagesRealtime() {
       loadStoryStats(p.story_id); // bumps the ❤️ count on the grid card, if visible
       if (_currentOwnStoryStatsId === p.story_id) viewOwnStoryStats(p.story_id); // live-refresh the open stats modal
     })
-    .subscribe((status) => {
+    .subscribe((status, err) => {
+      // TEMP DEBUG — remove once new-messages bug is confirmed fixed.
+      console.log('[dg-realtime] private-message-notify status:', status, err || '');
       // Same fix as contacts-notify and group-notify: rejoin once if the
       // socket drops, so a dead connection doesn't stay dead silently.
       if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
@@ -20298,6 +20288,63 @@ async function subscribeToPush(registration, verbose) {
     steps.push('ERROR: ' + (e && e.name) + ' — ' + (e && e.message));
     console.log('Push subscription failed:', e);
     report('FAILED — see error above.');
+  }
+}
+// ═══════════════════════════════════════
+// NATIVE PUSH (FCM) — for the APK only. sw.js/subscribeToPush() above
+// remain exactly as-is for the website, where real web push works fine.
+// This is separate because Android kills the WebView's JS in the
+// background, so browser-style push (which needs that JS alive to receive
+// the event) can't reliably wake a fully-closed app — only an OS-level
+// FCM delivery can. Requires @capacitor/push-notifications to be installed
+// and synced into the Android project; no-ops harmlessly if it isn't.
+// ═══════════════════════════════════════
+let _fcmRegistered = false;
+async function registerNativePush() {
+  const isNative = window.Capacitor && window.Capacitor.isNativePlatform && window.Capacitor.isNativePlatform();
+  if (!isNative || !currentUser || !currentUser.id) return;
+  if (_fcmRegistered) return; // once per app session is enough — token rarely changes mid-session
+
+  const PushNotifications = window.Capacitor.Plugins && window.Capacitor.Plugins.PushNotifications;
+  if (!PushNotifications) {
+    console.log('PushNotifications plugin not found — did you npm install @capacitor/push-notifications + cap sync?');
+    return;
+  }
+
+  try {
+    let perm = await PushNotifications.checkPermissions();
+    if (perm.receive !== 'granted') {
+      perm = await PushNotifications.requestPermissions();
+    }
+    if (perm.receive !== 'granted') return; // user declined — nothing more to do here
+
+    // 'registration' fires once Firebase hands back a real device token.
+    PushNotifications.addListener('registration', async (token) => {
+      try {
+        await sbQueryUpsert('fcm_tokens', { user_id: currentUser.id, token: token.value, updated_at: new Date().toISOString() });
+        _fcmRegistered = true;
+      } catch (e) { console.log('saving fcm token failed:', e); }
+    });
+    PushNotifications.addListener('registrationError', (err) => {
+      console.log('FCM registration error:', err);
+    });
+
+    // Tapping a delivered system notification while the app was closed/
+    // backgrounded — route to the right chat, same as sw.js's deep-link
+    // handling does for the website.
+    PushNotifications.addListener('pushNotificationActionPerformed', (action) => {
+      const data = action.notification && action.notification.data;
+      if (data && data.url) {
+        try {
+          const u = new URL(data.url, location.origin);
+          handleDeepLinkParams(new URLSearchParams(u.search));
+        } catch (e) { /* malformed url payload — ignore */ }
+      }
+    });
+
+    await PushNotifications.register();
+  } catch (e) {
+    console.log('registerNativePush failed:', e);
   }
 }
 </script>
