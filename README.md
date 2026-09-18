@@ -8,7 +8,7 @@ DgreatVerse is a social networking app And website with real-time chat and push 
 
 - 💬 Real-time chat and messaging
 - 🔔 Push notifications (web push + native FCM on Android)
-- 📱 Installable as a Progressive Web App
+- 📱 Installable as a Progressive Apk
 - 🎨 Custom-branded UI with smooth animations
 - 🔗 Deep linking support
 
