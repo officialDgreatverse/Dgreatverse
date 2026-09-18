@@ -2,7 +2,7 @@
 
 **Connect, share, and thrive.** Chat, share moments, and stay connected with your community.
 
-DgreatVerse is a social networking app And website with real-time chat and push notifications, built to work seamlessly on both the web and as a native Android app.
+DgreatVerse is a social networking app And website with real-time chat and push notifications, built to work seamlessly on both the web and as an Android app.
 
 ## Features
 
