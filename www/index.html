@@ -1406,16 +1406,17 @@
   .ccb-btn { background: none; border: none; color: var(--silver); cursor: pointer; font-size: 11px; padding: 2px 4px; }
 
   .request-item {
-    display: flex; align-items: center; gap: 12px; padding: 12px;
+    display: flex; flex-direction: column; align-items: stretch; gap: 10px; padding: 12px;
     background: rgba(26,32,44,0.4); border: 1px solid rgba(var(--purple-glow-rgb),0.15);
     border-radius: 12px; margin-bottom: 8px;
   }
   .request-info { flex: 1; }
   .request-name { font-size: 14px; font-weight: 600; color: var(--white); }
   .request-sub { font-size: 11px; color: var(--text-muted); margin-top: 2px; }
-  .request-btns { display: flex; gap: 6px; }
-  .btn-accept { padding: 6px 14px; background: rgba(34,197,94,0.2); border: 1px solid rgba(34,197,94,0.4); border-radius: 8px; color: #4ade80; font-size: 12px; cursor: pointer; font-family: 'IBM Plex Sans', sans-serif; }
-  .btn-decline { padding: 6px 14px; background: rgba(255,79,79,0.15); border: 1px solid rgba(255,79,79,0.3); border-radius: 8px; color: #ff8080; font-size: 12px; cursor: pointer; font-family: 'IBM Plex Sans', sans-serif; }
+  .request-btns { display: flex; gap: 6px; width: 100%; }
+  .request-btns button { flex: 1; text-align: center; }
+  .btn-accept { padding: 6px 10px; background: rgba(34,197,94,0.2); border: 1px solid rgba(34,197,94,0.4); border-radius: 8px; color: #4ade80; font-size: 12px; cursor: pointer; font-family: 'IBM Plex Sans', sans-serif; }
+  .btn-decline { padding: 6px 10px; background: rgba(255,79,79,0.15); border: 1px solid rgba(255,79,79,0.3); border-radius: 8px; color: #ff8080; font-size: 12px; cursor: pointer; font-family: 'IBM Plex Sans', sans-serif; }
 
   .upload-area {
     border: 1px solid rgba(var(--purple-glow-rgb),0.28); border-radius: 12px;
@@ -5753,16 +5754,46 @@ async function loadContacts() {
   // don't already have cached data for, so the list sorts correctly right
   // away instead of waiting for a realtime event to fix it.
   const _myId = currentUser.id;
+
+  // Bulk-fetch MY OWN read markers once (one query for every contact, not
+  // one per contact) so we can reconcile the unread dot against the
+  // database below. private_reads already exists and is kept up to date by
+  // markPrivateRead() every time a chat is opened — it was only being used
+  // for the sender's "seen" checkmark before, but it's exactly the durable
+  // source of truth unread status needs too. Without this, a message whose
+  // live broadcast was missed during a silent reconnect gap (see
+  // joinPrivateMessagesRealtime) had genuinely nothing — not memory, not
+  // the database — telling the app it was unread, even though the contact
+  // list correctly re-sorted to show it as the latest conversation.
+  const { data: myReadRows } = await sbQuery('GET', 'private_reads', null,
+    `?user_id=eq.${_myId}&select=contact_id,last_read_at`);
+  const myLastReadMap = {};
+  (Array.isArray(myReadRows) ? myReadRows : []).forEach(r => { myLastReadMap[r.contact_id] = r.last_read_at; });
+
   await Promise.all(profiles.map(async (u) => {
-    if (contactMeta[u.id] && contactMeta[u.id].lastMsgTime) {
-      u._lastMsgTime = contactMeta[u.id].lastMsgTime;
-      return;
+    if (!(contactMeta[u.id] && contactMeta[u.id].lastMsgTime)) {
+      const { data: msgs } = await sbQuery('GET', 'messages', null,
+        `?or=(and(sender_id.eq.${_myId},receiver_id.eq.${u.id}),and(sender_id.eq.${u.id},receiver_id.eq.${_myId}))&order=created_at.desc&limit=1&select=created_at,sender_id`);
+      const latest = Array.isArray(msgs) && msgs.length ? msgs[0] : null;
+      contactMeta[u.id] = {
+        ...(contactMeta[u.id] || {}),
+        lastMsgTime: latest ? latest.created_at : null,
+        lastMsgSender: latest ? latest.sender_id : null
+      };
     }
-    const { data: msgs } = await sbQuery('GET', 'messages', null,
-      `?or=(and(sender_id.eq.${_myId},receiver_id.eq.${u.id}),and(sender_id.eq.${u.id},receiver_id.eq.${_myId}))&order=created_at.desc&limit=1&select=created_at`);
-    const latestTime = Array.isArray(msgs) && msgs.length ? msgs[0].created_at : null;
-    contactMeta[u.id] = { ...(contactMeta[u.id] || {}), lastMsgTime: latestTime };
-    u._lastMsgTime = latestTime;
+    u._lastMsgTime = contactMeta[u.id].lastMsgTime;
+
+    // Reconcile unread against the database. Skip if we already have a
+    // live-tracked unread count from a broadcast we DID catch this
+    // session — that's more precise (it's an actual count) than this,
+    // which can only tell us whether the single latest message is unread.
+    const meta = contactMeta[u.id];
+    if (!(meta.unread > 0) && meta.lastMsgSender && String(meta.lastMsgSender) === String(u.id)) {
+      const lastRead = myLastReadMap[u.id];
+      if (meta.lastMsgTime && (!lastRead || new Date(meta.lastMsgTime) > new Date(lastRead))) {
+        contactMeta[u.id] = { ...meta, unread: 1 };
+      }
+    }
   }));
 
   sortAndRenderContacts();
@@ -9854,6 +9885,7 @@ async function attachGroupToCommunity(groupId) {
 // so the recipient's pending badge updates instantly without polling.
 // And { type:'new_group_invite', to_user } so group invites appear in real-time.
 let contactsRealtimeChannel = null;
+let _contactsChannelEverUp = false; // tracks whether this channel has ever reached SUBSCRIBED before, so we can tell a genuine reconnect (drop + rejoin) apart from the very first connect
 const CONTACTS_NOTIFY_CHANNEL_NAME = 'contacts-notify';
 
 function joinContactsRealtime() {
@@ -9905,9 +9937,18 @@ function joinContactsRealtime() {
       // the person never backgrounded/foregrounded the app or got a
       // browser 'online' event — that's real, confirmed proof the network
       // is back, so resync right then instead of waiting on a guess.
-      if (status === 'SUBSCRIBED' && _contactsLoadWasOffline) {
-        _contactsLoadWasOffline = false;
-        resyncVisibleScreenOnReconnect();
+      if (status === 'SUBSCRIBED') {
+        // Either the narrow "first load happened while offline" case, or a
+        // genuine mid-session reconnect (this channel was up before, dropped
+        // silently — weak signal/lock — and just came back). Either way,
+        // any broadcasts missed during the gap are gone for good, so catch
+        // up once here. Still event-driven off the socket's own status
+        // callback, never a timer/poll.
+        if (_contactsLoadWasOffline || _contactsChannelEverUp) {
+          _contactsLoadWasOffline = false;
+          resyncVisibleScreenOnReconnect();
+        }
+        _contactsChannelEverUp = true;
       }
     });
 }
@@ -10039,6 +10080,7 @@ function broadcastGroupInviteSent(toUserId) {
 // { group_id, sender_id } event on this channel. Every other open browser
 // receives it instantly and runs the same unread/badge logic as before.
 let groupMessagesRealtimeChannel = null;
+let _groupChannelEverUp = false; // same reconnect-detector as contacts/private — first SUBSCRIBED is the initial connect, every one after is a drop+rejoin
 const GROUP_NOTIFY_CHANNEL_NAME = 'group-notify';
 
 function joinGroupMessagesRealtime() {
@@ -10108,6 +10150,11 @@ function joinGroupMessagesRealtime() {
       if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
         setTimeout(() => { if (currentUser) joinGroupMessagesRealtime(); }, 1000);
       }
+      if (status === 'SUBSCRIBED') {
+        // Same reconnect-catch-up as the private-message channel above.
+        if (_groupChannelEverUp) resyncVisibleScreenOnReconnect();
+        _groupChannelEverUp = true;
+      }
     });
 }
 
@@ -10142,10 +10189,10 @@ function broadcastReactionUpdateGroup(messageId) {
 // One shared channel every logged-in user joins. The moment someone sends a
 // private message, their browser broadcasts { sender_id, receiver_id }.
 // If the recipient currently has that exact chat open, it reloads instantly.
-// NOTE: this only speeds up delivery into an already-open chat. The unread
-// red-dot / contact-list sort still runs on the existing 4-second poll,
-// per Chi's instruction to leave that part as-is.
+// NOTE: the unread red-dot / contact-list sort below is also handled
+// straight off this same broadcast now — no poll involved anywhere here.
 let privateMessagesRealtimeChannel = null;
+let _privateChannelEverUp = false; // same reconnect-detector as contacts — first SUBSCRIBED is the initial connect, every one after is a drop+rejoin
 const PRIVATE_NOTIFY_CHANNEL_NAME = 'private-message-notify';
 
 function joinPrivateMessagesRealtime() {
@@ -10242,6 +10289,14 @@ function joinPrivateMessagesRealtime() {
       // socket drops, so a dead connection doesn't stay dead silently.
       if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
         setTimeout(() => { if (currentUser) joinPrivateMessagesRealtime(); }, 1000);
+      }
+      if (status === 'SUBSCRIBED') {
+        // A reconnect after a silent drop (weak signal/lock) while the app
+        // never backgrounded — visibilitychange/Capacitor 'resume' wouldn't
+        // have fired, so this is the only signal we get. Any broadcast
+        // missed during the gap is gone for good; catch up once here.
+        if (_privateChannelEverUp) resyncVisibleScreenOnReconnect();
+        _privateChannelEverUp = true;
       }
     });
 }
