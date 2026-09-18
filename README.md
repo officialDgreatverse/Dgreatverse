@@ -20,11 +20,12 @@ DgreatVerse is a social networking app And website with real-time chat and push 
 - **Native wrapper:** [Capacitor](https://capacitorjs.com) for Android APK builds
 
 ## Getting Started
-
-1. Clone the repo
-2. Open `index.html` in a browser, or serve it with any static file server
-3. Configure your Supabase project URL and keys
-4. For the Android build, install `@capacitor/push-notifications` and run `cap sync`
+1. open the website
+2. install APK via the pup bubble mascot
+3. or chat on the site
+4. get friend chat code created on sign up under the hamburger menu
+5. joint chat, input chat code and send friend a chat request
+6. once accepted ur connected 
 
 ## License
 
