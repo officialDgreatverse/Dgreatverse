@@ -1406,16 +1406,17 @@
   .ccb-btn { background: none; border: none; color: var(--silver); cursor: pointer; font-size: 11px; padding: 2px 4px; }
 
   .request-item {
-    display: flex; align-items: center; gap: 12px; padding: 12px;
+    display: flex; flex-direction: column; align-items: stretch; gap: 10px; padding: 12px;
     background: rgba(26,32,44,0.4); border: 1px solid rgba(var(--purple-glow-rgb),0.15);
     border-radius: 12px; margin-bottom: 8px;
   }
   .request-info { flex: 1; }
   .request-name { font-size: 14px; font-weight: 600; color: var(--white); }
   .request-sub { font-size: 11px; color: var(--text-muted); margin-top: 2px; }
-  .request-btns { display: flex; gap: 6px; }
-  .btn-accept { padding: 6px 14px; background: rgba(34,197,94,0.2); border: 1px solid rgba(34,197,94,0.4); border-radius: 8px; color: #4ade80; font-size: 12px; cursor: pointer; font-family: 'IBM Plex Sans', sans-serif; }
-  .btn-decline { padding: 6px 14px; background: rgba(255,79,79,0.15); border: 1px solid rgba(255,79,79,0.3); border-radius: 8px; color: #ff8080; font-size: 12px; cursor: pointer; font-family: 'IBM Plex Sans', sans-serif; }
+  .request-btns { display: flex; gap: 6px; width: 100%; }
+  .request-btns button { flex: 1; text-align: center; }
+  .btn-accept { padding: 6px 10px; background: rgba(34,197,94,0.2); border: 1px solid rgba(34,197,94,0.4); border-radius: 8px; color: #4ade80; font-size: 12px; cursor: pointer; font-family: 'IBM Plex Sans', sans-serif; }
+  .btn-decline { padding: 6px 10px; background: rgba(255,79,79,0.15); border: 1px solid rgba(255,79,79,0.3); border-radius: 8px; color: #ff8080; font-size: 12px; cursor: pointer; font-family: 'IBM Plex Sans', sans-serif; }
 
   .upload-area {
     border: 1px solid rgba(var(--purple-glow-rgb),0.28); border-radius: 12px;
@@ -2541,6 +2542,10 @@
       <div id="empty-zone-posts-hint" style="display:none;text-align:center;color:var(--text-muted);font-size:12px;padding:24px 14px;">
         No posts yet.
       </div>
+      <div id="zone-no-connection-hint" style="display:none;text-align:center;color:var(--text-muted);font-size:12px;padding:24px 14px;">
+        No connection — channels are live-only and don't show saved/old content.<br>
+        <button type="button" onclick="loadZoneChannels()" style="margin-top:10px;background:rgba(var(--purple-glow-rgb),0.15);border:1px solid rgba(var(--purple-glow-rgb),0.35);color:var(--gold-light,#DCE6F5);border-radius:14px;padding:6px 16px;font-size:12px;font-weight:600;cursor:pointer;">Try Again</button>
+      </div>
     </div>
     <!-- Hashtag feed — tap any #tag in a caption or the trending strip -->
     <div id="zone-tag-feed-view" style="display:none;">
@@ -3110,9 +3115,9 @@
 
 <!-- PUP bubble -->
 <div id="pup-wrap" class="pup-bubble look-classic" style="display:none;">
-  <div id="pup-notify" class="pup-notify-bubble" onclick="handlePupNotifyClick(event)">
+  <div id="pup-notify" class="pup-notify-bubble show" onclick="downloadDgvApk(event)">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12m0 0l-4-4m4 4l4-4M4 21h16"/></svg>
-    <span id="pup-notify-text">Install App</span>
+    <span id="pup-notify-text">Install APK</span>
   </div>
   <div class="pup-body">
     <div class="pup-hat">
@@ -5285,6 +5290,7 @@ async function initChatSpace() {
   try { joinContactsRealtime(); } catch (e) { console.log('joinContactsRealtime skipped:', e); }
   try { startStickerRealtimeWatch(); } catch (e) { console.log('startStickerRealtimeWatch skipped:', e); }
   try { joinTipsRealtime(); } catch (e) { console.log('joinTipsRealtime skipped:', e); }
+  try { registerNativePush(); } catch (e) { console.log('registerNativePush skipped:', e); }
   // Also check right now (covers stickers uploaded while logged out/offline,
   // which a live realtime subscription wouldn't have caught retroactively).
   loadStickerCache(true).catch(e => console.log('sticker badge check skipped:', e));
@@ -5748,16 +5754,46 @@ async function loadContacts() {
   // don't already have cached data for, so the list sorts correctly right
   // away instead of waiting for a realtime event to fix it.
   const _myId = currentUser.id;
+
+  // Bulk-fetch MY OWN read markers once (one query for every contact, not
+  // one per contact) so we can reconcile the unread dot against the
+  // database below. private_reads already exists and is kept up to date by
+  // markPrivateRead() every time a chat is opened — it was only being used
+  // for the sender's "seen" checkmark before, but it's exactly the durable
+  // source of truth unread status needs too. Without this, a message whose
+  // live broadcast was missed during a silent reconnect gap (see
+  // joinPrivateMessagesRealtime) had genuinely nothing — not memory, not
+  // the database — telling the app it was unread, even though the contact
+  // list correctly re-sorted to show it as the latest conversation.
+  const { data: myReadRows } = await sbQuery('GET', 'private_reads', null,
+    `?user_id=eq.${_myId}&select=contact_id,last_read_at`);
+  const myLastReadMap = {};
+  (Array.isArray(myReadRows) ? myReadRows : []).forEach(r => { myLastReadMap[r.contact_id] = r.last_read_at; });
+
   await Promise.all(profiles.map(async (u) => {
-    if (contactMeta[u.id] && contactMeta[u.id].lastMsgTime) {
-      u._lastMsgTime = contactMeta[u.id].lastMsgTime;
-      return;
+    if (!(contactMeta[u.id] && contactMeta[u.id].lastMsgTime)) {
+      const { data: msgs } = await sbQuery('GET', 'messages', null,
+        `?or=(and(sender_id.eq.${_myId},receiver_id.eq.${u.id}),and(sender_id.eq.${u.id},receiver_id.eq.${_myId}))&order=created_at.desc&limit=1&select=created_at,sender_id`);
+      const latest = Array.isArray(msgs) && msgs.length ? msgs[0] : null;
+      contactMeta[u.id] = {
+        ...(contactMeta[u.id] || {}),
+        lastMsgTime: latest ? latest.created_at : null,
+        lastMsgSender: latest ? latest.sender_id : null
+      };
     }
-    const { data: msgs } = await sbQuery('GET', 'messages', null,
-      `?or=(and(sender_id.eq.${_myId},receiver_id.eq.${u.id}),and(sender_id.eq.${u.id},receiver_id.eq.${_myId}))&order=created_at.desc&limit=1&select=created_at`);
-    const latestTime = Array.isArray(msgs) && msgs.length ? msgs[0].created_at : null;
-    contactMeta[u.id] = { ...(contactMeta[u.id] || {}), lastMsgTime: latestTime };
-    u._lastMsgTime = latestTime;
+    u._lastMsgTime = contactMeta[u.id].lastMsgTime;
+
+    // Reconcile unread against the database. Skip if we already have a
+    // live-tracked unread count from a broadcast we DID catch this
+    // session — that's more precise (it's an actual count) than this,
+    // which can only tell us whether the single latest message is unread.
+    const meta = contactMeta[u.id];
+    if (!(meta.unread > 0) && meta.lastMsgSender && String(meta.lastMsgSender) === String(u.id)) {
+      const lastRead = myLastReadMap[u.id];
+      if (meta.lastMsgTime && (!lastRead || new Date(meta.lastMsgTime) > new Date(lastRead))) {
+        contactMeta[u.id] = { ...meta, unread: 1 };
+      }
+    }
   }));
 
   sortAndRenderContacts();
@@ -6611,32 +6647,16 @@ function closeChannelsScreen() {
 }
 
 // ═══ ZONE — discovery feed: search & browse every public channel ═══
-// Loaded exactly once per app session (first time the tab is opened, or
-// after a full app reload). Switching to another tab and back must NOT
-// pull in newer posts — only the Home/refresh button (or leaving and
-// reopening the app) is allowed to do that.
-let _zoneInitialLoadDone = false;
+// Channels are real-time, not cached: every time this screen is opened it
+// does a fresh live fetch. If that fetch fails (no connection), we show an
+// honest "No connection" state instead of any saved/stale content — no
+// offline fallback, no auto-polling. The only way to load again after that
+// is the explicit Refresh button or the "Try Again" button in that state.
 function openZoneScreen() {
   document.getElementById('screen-zone').classList.add('active');
   document.getElementById('zone-search-input').value = '';
   filterZoneChannels('');
-  if (!_zoneInitialLoadDone) {
-    _zoneInitialLoadDone = true;
-    // Same cache-first pattern as Contacts: paint whatever was cached from
-    // last time INSTANTLY, before any network call, so opening Verse never
-    // shows a blank screen while the live fetch is in flight.
-    const cachedTrending = cacheLoad('zoneTrending');
-    const cachedAll = cacheLoad('zoneAllChannels');
-    const cachedPosts = cacheLoad('zoneDiscoverPosts');
-    if (Array.isArray(cachedTrending) && cachedTrending.length) { zoneTrendingChannels = cachedTrending; renderZoneTrending(); }
-    if (Array.isArray(cachedAll)) { allZoneChannels = cachedAll; cachedAll.forEach(c => { zoneChannelById[c.id] = c; }); }
-    if (Array.isArray(cachedPosts) && cachedPosts.length) {
-      zoneDiscoverPosts = cachedPosts;
-      _zoneOldestPostAt = cachedPosts[cachedPosts.length - 1].created_at;
-      renderZoneDiscoverPosts();
-    }
-    loadZoneChannels();
-  }
+  loadZoneChannels();
 }
 function closeZoneScreen() {
   document.getElementById('screen-zone').classList.remove('active');
@@ -6653,38 +6673,41 @@ function onZoneScroll() {
 }
 
 async function loadZoneChannels() {
+  const noConn = document.getElementById('zone-no-connection-hint');
   const [trendingRes, allRes] = await Promise.all([
     sbQuery('GET', 'channels', null, `?select=*&order=follower_count.desc.nullslast&limit=5`),
     sbQuery('GET', 'channels', null, `?select=*&order=created_at.desc`),
   ]);
-  // Never overwrite what's already showing with an empty list just because
-  // this particular fetch failed — offline/timeout returns data:null, and
-  // blindly doing `data || []` here used to wipe the whole Trending row
-  // (and channel search) on any hiccup instead of leaving it as-is.
-  if (trendingRes.offline || !Array.isArray(trendingRes.data)) {
-    if (!zoneTrendingChannels.length) {
-      const cached = cacheLoad('zoneTrending');
-      if (Array.isArray(cached) && cached.length) { zoneTrendingChannels = cached; renderZoneTrending(); }
-    }
-  } else {
+  const trendingOk = !trendingRes.offline && Array.isArray(trendingRes.data);
+  const allOk = !allRes.offline && Array.isArray(allRes.data);
+
+  if (trendingOk) {
     zoneTrendingChannels = trendingRes.data;
-    cacheSave('zoneTrending', zoneTrendingChannels);
     renderZoneTrending();
   }
-  if (allRes.offline || !Array.isArray(allRes.data)) {
-    if (!allZoneChannels.length) {
-      const cached = cacheLoad('zoneAllChannels');
-      if (Array.isArray(cached) && cached.length) { allZoneChannels = cached; cached.forEach(c => { zoneChannelById[c.id] = c; }); }
-    }
-  } else {
+  if (allOk) {
     allZoneChannels = allRes.data;
-    cacheSave('zoneAllChannels', allZoneChannels);
+    zoneChannelById = {};
+    allZoneChannels.forEach(c => { zoneChannelById[c.id] = c; });
   }
+
   const postsOk = await loadZoneDiscoverPosts();
-  // Report whether we actually got anything live, so callers (the Refresh
-  // button) can give honest feedback instead of guessing from
-  // navigator.onLine, which this app already treats as unreliable elsewhere.
-  return postsOk && !trendingRes.offline && !allRes.offline;
+  const gotLiveData = postsOk && trendingOk && allOk;
+
+  // Channels are live-only — a failed fetch means nothing trustworthy to
+  // show, so clear whatever's on screen and surface an honest "no
+  // connection" state instead of leaving stale content up.
+  if (!gotLiveData && !zoneDiscoverPosts.length) {
+    const grid = document.getElementById('zone-posts-grid');
+    const emptyHint = document.getElementById('empty-zone-posts-hint');
+    if (grid) grid.innerHTML = '';
+    if (emptyHint) emptyHint.style.display = 'none';
+    if (noConn) noConn.style.display = 'block';
+  } else if (noConn) {
+    noConn.style.display = 'none';
+  }
+
+  return gotLiveData;
 }
 
 function renderZoneTrending() {
@@ -6717,24 +6740,13 @@ async function loadZoneDiscoverPosts() {
   const { data, offline } = await sbQuery('GET', 'channel_posts_secure', null,
     `?has_media=eq.true&expires_at=gt.${now}&channel_id=neq.${AD_MASTER_CHANNEL_ID}&select=*&order=created_at.desc&limit=${ZONE_DISCOVER_PAGE_SIZE}`);
   if (offline || !Array.isArray(data)) {
-    // Fetch failed — leave whatever's currently on screen exactly as-is
-    // (it's either already-live content, or the cache openZoneScreen()
-    // painted in). Only reach for the cache here if nothing is showing at
-    // all yet (e.g. this got called before the cache-first paint ran).
-    if (!zoneDiscoverPosts.length) {
-      const cached = cacheLoad('zoneDiscoverPosts');
-      if (Array.isArray(cached) && cached.length) {
-        zoneDiscoverPosts = cached;
-        _zoneOldestPostAt = cached[cached.length - 1].created_at;
-        _zoneHasMorePosts = false; // don't try to paginate further on a cached snapshot
-        allZoneChannels.forEach(c => { zoneChannelById[c.id] = c; });
-        await renderZoneDiscoverPosts();
-      }
-    }
+    // Fetch failed — channels are live-only, no offline fallback. Leave the
+    // decision of what to show (existing content vs. "no connection") to
+    // the caller (loadZoneChannels), which knows the full picture across
+    // trending/all-channels/posts.
     return false;
   }
   zoneDiscoverPosts = data;
-  cacheSave('zoneDiscoverPosts', zoneDiscoverPosts);
   // Reset the pagination cursor to this fresh load.
   _zoneOldestPostAt = zoneDiscoverPosts.length ? zoneDiscoverPosts[zoneDiscoverPosts.length - 1].created_at : null;
   _zoneHasMorePosts = zoneDiscoverPosts.length === ZONE_DISCOVER_PAGE_SIZE;
@@ -7975,6 +7987,11 @@ async function openChannelScreen(channelId, origin) {
   document.getElementById('screen-channels').classList.remove('active');
   document.getElementById('screen-zone').classList.remove('active');
   document.getElementById('screen-channel-view').classList.add('active');
+  // Channels are live-only, per-channel — never let the previous channel's
+  // posts linger on screen (or count as "already loaded") while this one's
+  // fresh fetch is in flight or if it fails.
+  _channelPosts = [];
+  document.getElementById('channel-posts-feed').innerHTML = '';
   await loadChannelPosts(channelId);
 }
 
@@ -9868,6 +9885,7 @@ async function attachGroupToCommunity(groupId) {
 // so the recipient's pending badge updates instantly without polling.
 // And { type:'new_group_invite', to_user } so group invites appear in real-time.
 let contactsRealtimeChannel = null;
+let _contactsChannelEverUp = false; // tracks whether this channel has ever reached SUBSCRIBED before, so we can tell a genuine reconnect (drop + rejoin) apart from the very first connect
 const CONTACTS_NOTIFY_CHANNEL_NAME = 'contacts-notify';
 
 function joinContactsRealtime() {
@@ -9919,9 +9937,18 @@ function joinContactsRealtime() {
       // the person never backgrounded/foregrounded the app or got a
       // browser 'online' event — that's real, confirmed proof the network
       // is back, so resync right then instead of waiting on a guess.
-      if (status === 'SUBSCRIBED' && _contactsLoadWasOffline) {
-        _contactsLoadWasOffline = false;
-        resyncVisibleScreenOnReconnect();
+      if (status === 'SUBSCRIBED') {
+        // Either the narrow "first load happened while offline" case, or a
+        // genuine mid-session reconnect (this channel was up before, dropped
+        // silently — weak signal/lock — and just came back). Either way,
+        // any broadcasts missed during the gap are gone for good, so catch
+        // up once here. Still event-driven off the socket's own status
+        // callback, never a timer/poll.
+        if (_contactsLoadWasOffline || _contactsChannelEverUp) {
+          _contactsLoadWasOffline = false;
+          resyncVisibleScreenOnReconnect();
+        }
+        _contactsChannelEverUp = true;
       }
     });
 }
@@ -10053,6 +10080,7 @@ function broadcastGroupInviteSent(toUserId) {
 // { group_id, sender_id } event on this channel. Every other open browser
 // receives it instantly and runs the same unread/badge logic as before.
 let groupMessagesRealtimeChannel = null;
+let _groupChannelEverUp = false; // same reconnect-detector as contacts/private — first SUBSCRIBED is the initial connect, every one after is a drop+rejoin
 const GROUP_NOTIFY_CHANNEL_NAME = 'group-notify';
 
 function joinGroupMessagesRealtime() {
@@ -10113,12 +10141,19 @@ function joinGroupMessagesRealtime() {
       // that one message's reaction chip, no full reload.
       if (activeGroup) loadReactions(p.message_id, 'group');
     })
-    .subscribe((status) => {
+    .subscribe((status, err) => {
+      // TEMP DEBUG — remove once new-messages bug is confirmed fixed.
+      console.log('[dg-realtime] group-notify status:', status, err || '');
       // Same fix as contacts-notify: mobile sockets drop silently on
       // lock/background/weak signal. Rejoin once on an actual disconnect —
       // event-driven, not a timer/polling loop.
       if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
         setTimeout(() => { if (currentUser) joinGroupMessagesRealtime(); }, 1000);
+      }
+      if (status === 'SUBSCRIBED') {
+        // Same reconnect-catch-up as the private-message channel above.
+        if (_groupChannelEverUp) resyncVisibleScreenOnReconnect();
+        _groupChannelEverUp = true;
       }
     });
 }
@@ -10154,10 +10189,10 @@ function broadcastReactionUpdateGroup(messageId) {
 // One shared channel every logged-in user joins. The moment someone sends a
 // private message, their browser broadcasts { sender_id, receiver_id }.
 // If the recipient currently has that exact chat open, it reloads instantly.
-// NOTE: this only speeds up delivery into an already-open chat. The unread
-// red-dot / contact-list sort still runs on the existing 4-second poll,
-// per Chi's instruction to leave that part as-is.
+// NOTE: the unread red-dot / contact-list sort below is also handled
+// straight off this same broadcast now — no poll involved anywhere here.
 let privateMessagesRealtimeChannel = null;
+let _privateChannelEverUp = false; // same reconnect-detector as contacts — first SUBSCRIBED is the initial connect, every one after is a drop+rejoin
 const PRIVATE_NOTIFY_CHANNEL_NAME = 'private-message-notify';
 
 function joinPrivateMessagesRealtime() {
@@ -10247,11 +10282,21 @@ function joinPrivateMessagesRealtime() {
       loadStoryStats(p.story_id); // bumps the ❤️ count on the grid card, if visible
       if (_currentOwnStoryStatsId === p.story_id) viewOwnStoryStats(p.story_id); // live-refresh the open stats modal
     })
-    .subscribe((status) => {
+    .subscribe((status, err) => {
+      // TEMP DEBUG — remove once new-messages bug is confirmed fixed.
+      console.log('[dg-realtime] private-message-notify status:', status, err || '');
       // Same fix as contacts-notify and group-notify: rejoin once if the
       // socket drops, so a dead connection doesn't stay dead silently.
       if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
         setTimeout(() => { if (currentUser) joinPrivateMessagesRealtime(); }, 1000);
+      }
+      if (status === 'SUBSCRIBED') {
+        // A reconnect after a silent drop (weak signal/lock) while the app
+        // never backgrounded — visibilitychange/Capacitor 'resume' wouldn't
+        // have fired, so this is the only signal we get. Any broadcast
+        // missed during the gap is gone for good; catch up once here.
+        if (_privateChannelEverUp) resyncVisibleScreenOnReconnect();
+        _privateChannelEverUp = true;
       }
     });
 }
@@ -19855,95 +19900,16 @@ applyWallpaper();
 </script>
 
 <script>
-// ═══ PUP install / update notification ═══
-// Replaces the old always-visible "Download App" pill. A small speech
-// bubble appears above PUP's head only when there's something to do:
-//  - "Install App"  → a beforeinstallprompt is available and the app
-//                      isn't already installed/running standalone.
-//  - "Update App"    → a new service-worker version is waiting to activate.
-// Otherwise the bubble stays hidden — no nagging, no blocking the UI.
-let dgvDeferredInstallPrompt = null;
-let dgvUpdateWaitingWorker = null;
-let dgvApkUpdateInfo = null; // set when version.json on GitHub reports a newer APK build
+// ═══ PUP install APK bubble ═══
+// A small speech bubble sits above PUP's head at all times, linking
+// straight to the latest release.apk on GitHub. No version polling,
+// no update checks — just a direct download link.
+const DGV_APK_DOWNLOAD_URL = 'https://github.com/officialdgreatverse/Dgreatverse/releases/latest/download/release.apk';
 
-// Bump this to match the versionCode in version.json every time you cut a
-// new APK release via build-apk.yml. This is the ONE manual step — the web
-// page has no way to ask the installed APK what version it actually is.
-const CURRENT_APK_VERSION_CODE = 111;
-
-const DGV_VERSION_JSON_URL = 'https://officialdgreatverse.github.io/Dgreatverse/version.json';
-
-function checkForApkUpdate() {
-  fetch(DGV_VERSION_JSON_URL, { cache: 'no-store' })
-    .then(function (r) { return r.json(); })
-    .then(function (data) {
-      if (data && typeof data.versionCode === 'number' && data.versionCode > CURRENT_APK_VERSION_CODE) {
-        dgvApkUpdateInfo = data; // { versionCode, versionName, apkUrl, notes }
-        refreshPupNotify();
-      }
-    })
-    .catch(function () { /* offline or rate-limited — fail silently */ });
-}
-
-function dgvIsAppInstalled() {
-  return window.matchMedia('(display-mode: standalone)').matches ||
-         window.navigator.standalone === true;
-}
-
-function refreshPupNotify() {
-  // Release build: only the APK-update checker drives this bubble.
-  // No "Install App" state, no service-worker "Update App" state —
-  // those only make sense on the web version. If there's no newer
-  // APK available, the bubble stays fully hidden.
-  const bubble = document.getElementById('pup-notify');
-  const label = document.getElementById('pup-notify-text');
-  if (!bubble || !label) return;
-
-  if (dgvApkUpdateInfo) {
-    label.textContent = `Update v${dgvApkUpdateInfo.versionName || dgvApkUpdateInfo.versionCode}`;
-    bubble.classList.add('show');
-  } else {
-    bubble.classList.remove('show');
-  }
-}
-
-function handlePupNotifyClick(event) {
+function downloadDgvApk(event) {
   if (event) event.stopPropagation(); // don't let this drag/click PUP itself
-
-  if (dgvApkUpdateInfo) {
-    // Take them straight to the new APK so they can download/install it.
-    if (dgvApkUpdateInfo.apkUrl) window.open(dgvApkUpdateInfo.apkUrl, '_blank');
-    return;
-  }
-
-  if (dgvUpdateWaitingWorker) {
-    // Tell the waiting worker to take over, then reload once it does.
-    dgvUpdateWaitingWorker.postMessage({ type: 'SKIP_WAITING' });
-    navigator.serviceWorker.addEventListener('controllerchange', function () {
-      window.location.reload();
-    }, { once: true });
-    return;
-  }
-
-  if (dgvDeferredInstallPrompt) {
-    dgvDeferredInstallPrompt.prompt();
-    dgvDeferredInstallPrompt.userChoice.finally(function () {
-      dgvDeferredInstallPrompt = null;
-      refreshPupNotify();
-    });
-  }
+  window.open(DGV_APK_DOWNLOAD_URL, '_blank');
 }
-
-window.addEventListener('beforeinstallprompt', function (e) {
-  e.preventDefault();
-  dgvDeferredInstallPrompt = e;
-  refreshPupNotify();
-});
-
-window.addEventListener('appinstalled', function () {
-  dgvDeferredInstallPrompt = null;
-  refreshPupNotify();
-});
 
 if ('serviceWorker' in navigator) {
   window.addEventListener('load', function() {
@@ -19951,25 +19917,6 @@ if ('serviceWorker' in navigator) {
       .then(function(reg) {
         console.log('SW registered');
         subscribeToPush(reg);
-
-        // A worker already waiting (e.g. update landed while app was closed).
-        if (reg.waiting) {
-          dgvUpdateWaitingWorker = reg.waiting;
-          refreshPupNotify();
-        }
-
-        // A new worker found mid-session — wait for it to finish installing,
-        // then flag it as ready and available to activate.
-        reg.addEventListener('updatefound', function () {
-          const newWorker = reg.installing;
-          if (!newWorker) return;
-          newWorker.addEventListener('statechange', function () {
-            if (newWorker.state === 'installed' && navigator.serviceWorker.controller) {
-              dgvUpdateWaitingWorker = newWorker;
-              refreshPupNotify();
-            }
-          });
-        });
       })
       .catch(function(err) { console.log('SW failed: ', err); });
   });
@@ -19983,13 +19930,6 @@ if ('serviceWorker' in navigator) {
     }
   });
 }
-
-// Initial state (covers standalone/installed detection before any events fire)
-refreshPupNotify();
-
-// Ask GitHub for the latest version.json — if it reports a newer APK build
-// than CURRENT_APK_VERSION_CODE, the PUP bubble switches to "Update vX.X".
-checkForApkUpdate();
 
 // Your public VAPID key (safe to expose in frontend code).
 const VAPID_PUBLIC_KEY = 'BNhdNqZtxZuNU1teK4q6eNdjBfRR9dMMsynyja0aknOhTkQ0yQ8UakuPMLH7dFGYtYcWfaCG_bV3MCFw4FoDOwc';
@@ -20298,6 +20238,63 @@ async function subscribeToPush(registration, verbose) {
     steps.push('ERROR: ' + (e && e.name) + ' — ' + (e && e.message));
     console.log('Push subscription failed:', e);
     report('FAILED — see error above.');
+  }
+}
+// ═══════════════════════════════════════
+// NATIVE PUSH (FCM) — for the APK only. sw.js/subscribeToPush() above
+// remain exactly as-is for the website, where real web push works fine.
+// This is separate because Android kills the WebView's JS in the
+// background, so browser-style push (which needs that JS alive to receive
+// the event) can't reliably wake a fully-closed app — only an OS-level
+// FCM delivery can. Requires @capacitor/push-notifications to be installed
+// and synced into the Android project; no-ops harmlessly if it isn't.
+// ═══════════════════════════════════════
+let _fcmRegistered = false;
+async function registerNativePush() {
+  const isNative = window.Capacitor && window.Capacitor.isNativePlatform && window.Capacitor.isNativePlatform();
+  if (!isNative || !currentUser || !currentUser.id) return;
+  if (_fcmRegistered) return; // once per app session is enough — token rarely changes mid-session
+
+  const PushNotifications = window.Capacitor.Plugins && window.Capacitor.Plugins.PushNotifications;
+  if (!PushNotifications) {
+    console.log('PushNotifications plugin not found — did you npm install @capacitor/push-notifications + cap sync?');
+    return;
+  }
+
+  try {
+    let perm = await PushNotifications.checkPermissions();
+    if (perm.receive !== 'granted') {
+      perm = await PushNotifications.requestPermissions();
+    }
+    if (perm.receive !== 'granted') return; // user declined — nothing more to do here
+
+    // 'registration' fires once Firebase hands back a real device token.
+    PushNotifications.addListener('registration', async (token) => {
+      try {
+        await sbQueryUpsert('fcm_tokens', { user_id: currentUser.id, token: token.value, updated_at: new Date().toISOString() });
+        _fcmRegistered = true;
+      } catch (e) { console.log('saving fcm token failed:', e); }
+    });
+    PushNotifications.addListener('registrationError', (err) => {
+      console.log('FCM registration error:', err);
+    });
+
+    // Tapping a delivered system notification while the app was closed/
+    // backgrounded — route to the right chat, same as sw.js's deep-link
+    // handling does for the website.
+    PushNotifications.addListener('pushNotificationActionPerformed', (action) => {
+      const data = action.notification && action.notification.data;
+      if (data && data.url) {
+        try {
+          const u = new URL(data.url, location.origin);
+          handleDeepLinkParams(new URLSearchParams(u.search));
+        } catch (e) { /* malformed url payload — ignore */ }
+      }
+    });
+
+    await PushNotifications.register();
+  } catch (e) {
+    console.log('registerNativePush failed:', e);
   }
 }
 </script>
