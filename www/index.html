@@ -4120,6 +4120,28 @@ window.addEventListener('online', () => {
   requestResync();
 });
 
+// Android WebViews fire 'visibilitychange' to 'hidden' then straight back to
+// 'visible' on things that are NOT a real backgrounding at all — most
+// commonly the on-screen keyboard opening/closing while typing or sending a
+// message. Every one of those blips used to be treated exactly like coming
+// back from the app switcher: full realtime channel rejoin + a full
+// contacts/messages resync. That's what was showing up as the contact list
+// (and the open chat) repeatedly re-sorting/re-rendering while someone was
+// just typing — not bad data, just a genuine "we reconnected" workflow
+// firing dozens of times during one message. A real backgrounding (screen
+// lock, app switch) stays hidden for at least a second or two; a keyboard
+// toggle is hidden for at most a few milliseconds, if it registers as
+// hidden at all. This tracks how long we were actually hidden so both
+// resync triggers below can tell the two apart.
+let _lastHiddenAt = null;
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden') { _lastHiddenAt = Date.now(); return; }
+});
+function _wasGenuinelyBackgrounded() {
+  if (!_lastHiddenAt) return true; // never saw a 'hidden' event at all — don't block a legitimate first resync
+  return (Date.now() - _lastHiddenAt) >= 1200;
+}
+
 // BACKUP TRIGGER for the APK/WebView build — the browser 'online' event
 // above is not reliable inside an Android WebView (it can simply never
 // fire even though the device is genuinely connected), and neither is
@@ -4131,6 +4153,7 @@ window.addEventListener('online', () => {
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState !== 'visible') return;
   if (!currentUser) return;
+  if (!_wasGenuinelyBackgrounded()) return;
   requestResync();
 });
 
@@ -5226,6 +5249,16 @@ function renderCachedContactsImmediately() {
   if (Array.isArray(cached) && cached.length) {
     myContacts = cached;
     knownContactIds = new Set(cached.map(u => u.id));
+    // Sorting now reads exclusively from contactMeta (see sortAndRenderContacts),
+    // which is still empty this early — seed it from each cached contact's
+    // last-known _lastMsgTime so this very first paint is already in the
+    // right order, not just "whatever order the cache array happened to be
+    // saved in."
+    cached.forEach(u => {
+      if (u._lastMsgTime && !(contactMeta[u.id] && contactMeta[u.id].lastMsgTime)) {
+        contactMeta[u.id] = { ...(contactMeta[u.id] || {}), lastMsgTime: u._lastMsgTime };
+      }
+    });
     renderContacts();
   }
 }
@@ -5786,8 +5819,30 @@ async function _loadContactsImpl() {
     .map(r => Array.isArray(r.data) && r.data.length > 0 ? r.data[0] : null)
     .filter(Boolean);
 
-  myContacts = profiles;
-  knownContactIds = new Set(profiles.map(u => u.id));
+  // MERGE into the existing on-screen order instead of replacing the array
+  // outright. Every loadContacts() call (cold start, reconnect, resync) was
+  // rebuilding myContacts fresh from this fetch, in whatever order the
+  // `contacts` table happened to return rows in (no ORDER BY — Postgres
+  // doesn't guarantee a fixed order without one). Two contacts with equal
+  // or no lastMsgTime had no fixed order relative to each other, so a
+  // routine reconnect/resync alone could silently re-scramble them behind
+  // whichever contact a moveContactToTop() call had legitimately just
+  // bumped — that's what showed up as two untouched contacts trading
+  // places after a message was sent to a totally different one. Preserving
+  // the order already on screen and only appending genuinely-new contacts
+  // means a reload can never reorder anyone on its own; sortAndRenderContacts()
+  // below still moves people up for a real, newer message, but ties keep
+  // whatever position they already had instead of reshuffling.
+  const profileById = {};
+  profiles.forEach(p => { profileById[String(p.id)] = p; });
+  const merged = [];
+  myContacts.forEach(u => {
+    const p = profileById[String(u.id)];
+    if (p) { merged.push(p); delete profileById[String(p.id)]; }
+  });
+  profiles.forEach(p => { if (profileById[String(p.id)]) { merged.push(p); delete profileById[String(p.id)]; } });
+  myContacts = merged;
+  knownContactIds = new Set(myContacts.map(u => u.id));
 
   // Restore last-message-time from contactMeta (maintained by the realtime handlers).
   // contactMeta only lives in memory, so right after a fresh page load it's
@@ -5851,17 +5906,81 @@ async function _loadContactsImpl() {
 }
 
 // Sort myContacts by lastMsgTime descending, then render
+// contactMeta is the ONE place a live Supabase broadcast ever writes a
+// contact's last-message-time to — sort reads straight from it, not from a
+// copy stashed on the contact object. There used to be two separate
+// values in play (contactMeta[id].lastMsgTime, kept fresh by every live
+// event, and a `_lastMsgTime` field mirrored onto the contact object,
+// which only some code paths remembered to update). When those two drifted
+// apart — a contact object rebuilt fresh by a reload before its mirror got
+// re-set, for instance — the list would sort by the stale one and then
+// snap back to the live one on the next render, which is exactly the
+// up/down/up flicker: two sources of truth disagreeing. Now there's only
+// one, so there's nothing left for it to disagree with.
 function sortAndRenderContacts() {
   myContacts.sort((a, b) => {
-    const ta = a._lastMsgTime ? new Date(a._lastMsgTime).getTime() : 0;
-    const tb = b._lastMsgTime ? new Date(b._lastMsgTime).getTime() : 0;
-    return tb - ta;
+    const ta = (contactMeta[a.id] && contactMeta[a.id].lastMsgTime) ? new Date(contactMeta[a.id].lastMsgTime).getTime() : 0;
+    const tb = (contactMeta[b.id] && contactMeta[b.id].lastMsgTime) ? new Date(contactMeta[b.id].lastMsgTime).getTime() : 0;
+    if (tb !== ta) return tb - ta;
+    // DETERMINISTIC TIEBREAKER — this is the actual fix for contacts
+    // "fighting"/reshuffling on their own. loadContacts()'s DB query has no
+    // ORDER BY, so Postgres can return the `contacts` rows in a different
+    // order on every single fetch (cold start, every reconnect, every
+    // requestResync). Any two contacts tied on lastMsgTime — which is every
+    // contact you haven't messaged recently, i.e. most of the list — had no
+    // fixed relative order: they got silently re-scrambled behind the one
+    // contact that WAS correctly moved to top by moveContactToTop(), which
+    // is exactly what looked like "the rest of the contacts fighting for
+    // position." Falling back to a stable sort on the contact's own id means
+    // ties always resolve the same way no matter what order the fetch
+    // happened to come back in.
+    return String(a.id).localeCompare(String(b.id));
   });
   renderContacts();
-  cacheSave('contacts', myContacts); // keep the offline copy fresh
+  cacheSave('contacts', myContacts); // keep the offline copy fresh (still carries each contact's last-known _lastMsgTime, which seeds contactMeta again on next cold start)
 }
 
+// A single new message (mine or theirs) means exactly one contact needs to
+// move to position 0 — it does NOT need the whole list re-sorted by
+// timestamp comparison. Comparing timestamps for this case was the last
+// place this could still misfire: my device's clock and the server's clock
+// are never perfectly identical, so two messages sent moments apart could
+// compare in the "wrong" order depending on whose clock generated which
+// timestamp, and that's still a comparison — not a guarantee. This instead
+// just physically moves the one contact to the front of the array, no
+// comparison involved, so it goes to the top and there is nothing left
+// that can later decide it belongs somewhere else.
+function moveContactToTop(contactId, timestampIso) {
+  contactMeta[contactId] = { ...(contactMeta[contactId] || {}), lastMsgTime: timestampIso };
+  const idx = myContacts.findIndex(u => String(u.id) === String(contactId));
+  if (idx > 0) {
+    const [c] = myContacts.splice(idx, 1);
+    myContacts.unshift(c);
+  }
+  renderContacts();
+  cacheSave('contacts', myContacts);
+}
+
+// renderContacts() used to rebuild the whole contacts list the instant it
+// was called — but opening a chat (or sending/receiving a message) fires it
+// 2-3 times back to back (unread-clear, contact-settings load, message load
+// each call it independently), and each of those calls can resolve with
+// slightly different data timing. Rebuilding the DOM 2-3 times in the same
+// instant is exactly what showed up as a contact "blinking" / jumping up and
+// down. Now every call just requests a repaint; if more calls come in before
+// the browser's next frame, they collapse into ONE actual rebuild using
+// whatever the latest state is by then — same data, one paint, no flicker.
+let _contactsRenderScheduled = false;
 function renderContacts() {
+  if (_contactsRenderScheduled) return;
+  _contactsRenderScheduled = true;
+  requestAnimationFrame(() => {
+    _contactsRenderScheduled = false;
+    _renderContactsNow();
+  });
+}
+
+function _renderContactsNow() {
   const hint = document.getElementById('empty-contacts-hint');
   const list = document.getElementById('contacts-list');
 
@@ -10015,6 +10134,11 @@ function leaveContactsRealtime() {
 // until the chat was manually reopened/reloaded.
 document.addEventListener('visibilitychange', async () => {
   if (document.visibilityState === 'visible' && currentUser) {
+    // Same keyboard-toggle-isn't-a-real-resume guard as the resync trigger
+    // above — this handler is the heavier one (rejoins every realtime
+    // socket AND force-reloads whatever chat is open), so without this
+    // check it was the main thing firing repeatedly during normal typing.
+    if (!_wasGenuinelyBackgrounded()) return;
     // Confirm/refresh the session BEFORE touching contacts/messages below.
     // Coming back to the foreground after a long time away is exactly when
     // the access token is most likely to have expired — refreshing it here
@@ -10251,29 +10375,23 @@ function joinPrivateMessagesRealtime() {
 
       const senderId = p.sender_id;
       const now = p.created_at || new Date().toISOString();
-
-      // Update contactMeta for sort order
-      const prev = contactMeta[senderId] || {};
-      contactMeta[senderId] = { ...prev, lastMsgTime: now };
-
-      // Update the contact's _lastMsgTime so sortAndRenderContacts works
       const contact = myContacts.find(u => String(u.id) === String(senderId));
-      if (contact) contact._lastMsgTime = now;
 
       const chatIsOpen = activeChatContact && String(activeChatContact.id) === String(senderId);
 
       if (chatIsOpen) {
-        // Chat is open — deliver message instantly, no unread dot
+        // Chat is open — deliver message instantly, no unread dot. Still
+        // moves to top deterministically (see moveContactToTop) — an open
+        // chat doesn't mean this contact was already at the top of the list.
+        moveContactToTop(senderId, now);
         loadPrivateMessages();
         const area = document.getElementById('private-messages-area');
         if (area) area.scrollTop = area.scrollHeight;
       } else {
-        // Chat is NOT open — show unread red dot and re-sort contacts list
-        contactMeta[senderId] = {
-          ...contactMeta[senderId],
-          unread: (prev.unread || 0) + 1
-        };
-        sortAndRenderContacts();
+        // Chat is NOT open — show unread red dot and move to top
+        const prevUnread = (contactMeta[senderId] && contactMeta[senderId].unread) || 0;
+        contactMeta[senderId] = { ...(contactMeta[senderId] || {}), unread: prevUnread + 1 };
+        moveContactToTop(senderId, now);
         // We only get here while genuinely connected (this IS a live
         // realtime event), so it's a safe moment to also persist the
         // actual message into this contact's offline cache. Without this,
@@ -10393,13 +10511,10 @@ function broadcastPrivateMessageSent(receiverId) {
   if (!currentUser) return;
 
   const now = new Date().toISOString();
-  const prev = contactMeta[receiverId] || {};
-  contactMeta[receiverId] = { ...prev, lastMsgTime: now };
-  const contact = myContacts.find(u => String(u.id) === String(receiverId));
-  if (contact) {
-    contact._lastMsgTime = now;
-    sortAndRenderContacts();
-  }
+  // Deterministic move-to-front — see moveContactToTop() — instead of a
+  // timestamp-comparison sort, so this contact lands at the top and stays
+  // there regardless of any clock skew between my device and anyone else's.
+  moveContactToTop(receiverId, now);
 
   if (!privateMessagesRealtimeChannel) return;
   privateMessagesRealtimeChannel.send({
@@ -12128,8 +12243,14 @@ async function loadPrivateMessages() {
   renderPrivateMessages(visible);
   // Keep the last 100 messages of this conversation cached for offline viewing.
   cacheSave('privmsgs_' + theirId, visible.slice(-100));
-  // Re-sort contacts (new message may have arrived)
-  await loadContacts();
+  // NOTE: no full loadContacts() re-fetch here anymore. Contact re-sorting
+  // is already handled instantly by broadcastPrivateMessageSent() (when I
+  // send) and the new_private_message broadcast handler (when I receive) —
+  // both call sortAndRenderContacts() directly off local data. Re-fetching
+  // the entire contacts list from the server every single time a chat opens
+  // or a message goes through was redundant, and its network-timing lag
+  // behind the instant local re-sort was the other half of the contact list
+  // "blinking" between positions.
   // Record that I've now read up to this point, and let the sender know
   // (so their status dots flip live if they still have this chat open).
   markPrivateRead(theirId);
@@ -18138,6 +18259,29 @@ async function handleSetNewPassword() {
     const authUser = updateData.user;
     const { data: sessionData } = await sbRealtime.auth.getSession();
     currentAccessToken = sessionData && sessionData.session ? sessionData.session.access_token : null;
+
+    // secure-login's own record_login_attempt cleanup never runs for a
+    // password reset (this path skips secure-login entirely and goes
+    // straight to Supabase Auth), so a stale lockout from before the reset
+    // would otherwise still block the very next login attempt even with the
+    // correct new password. clear-login-lockout does the same cleanup,
+    // gated on this just-issued, just-verified session token. Best-effort:
+    // if it fails, don't block the person from finishing their reset — the
+    // lockout will simply clear itself next time it naturally expires.
+    if (currentAccessToken) {
+      try {
+        await fetch(`${SUPABASE_URL}/functions/v1/clear-login-lockout`, {
+          method: 'POST',
+          headers: {
+            'apikey': SUPABASE_KEY,
+            'Authorization': `Bearer ${currentAccessToken}`,
+            'Content-Type': 'application/json',
+          },
+        });
+      } catch (e) {
+        console.warn('clear-login-lockout call failed (non-fatal):', e);
+      }
+    }
 
     const { data: rows } = await sbQuery('GET', 'users', null, `?id=eq.${authUser.id}&select=id,name,email,chat_code,avatar_url,avatar_public_id,about,is_vip,vip_expires_at`);
     let profile = rows && rows[0];
