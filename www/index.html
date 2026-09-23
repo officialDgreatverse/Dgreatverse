@@ -5866,27 +5866,39 @@ async function _loadContactsImpl() {
   const myLastReadMap = {};
   (Array.isArray(myReadRows) ? myReadRows : []).forEach(r => { myLastReadMap[r.contact_id] = r.last_read_at; });
 
+  // ALWAYS ask the database for each contact's latest message — never skip
+  // because contactMeta already has a lastMsgTime. That value can come from
+  // the offline cache (seeded at app open) or from a live broadcast, and a
+  // broadcast sent while this device was offline/backgrounded is gone for
+  // good, so memory can be stale. The database is the only source that
+  // always knows what really arrived.
   await Promise.all(profiles.map(async (u) => {
-    if (!(contactMeta[u.id] && contactMeta[u.id].lastMsgTime)) {
-      const { data: msgs } = await sbQuery('GET', 'messages', null,
-        `?or=(and(sender_id.eq.${_myId},receiver_id.eq.${u.id}),and(sender_id.eq.${u.id},receiver_id.eq.${_myId}))&order=created_at.desc&limit=1&select=created_at,sender_id`);
-      const latest = Array.isArray(msgs) && msgs.length ? msgs[0] : null;
-      contactMeta[u.id] = {
-        ...(contactMeta[u.id] || {}),
-        lastMsgTime: latest ? latest.created_at : null,
-        lastMsgSender: latest ? latest.sender_id : null
-      };
-    }
-    u._lastMsgTime = contactMeta[u.id].lastMsgTime;
+    const { data: msgs } = await sbQuery('GET', 'messages', null,
+      `?or=(and(sender_id.eq.${_myId},receiver_id.eq.${u.id}),and(sender_id.eq.${u.id},receiver_id.eq.${_myId}))&order=created_at.desc&limit=1&select=created_at,sender_id`);
+    const latest = Array.isArray(msgs) && msgs.length ? msgs[0] : null;
+    const prev = contactMeta[u.id] || {};
 
-    // Reconcile unread against the database. Skip if we already have a
-    // live-tracked unread count from a broadcast we DID catch this
-    // session — that's more precise (it's an actual count) than this,
-    // which can only tell us whether the single latest message is unread.
+    // Keep whichever time is newer (a live event may be a hair ahead of the
+    // DB row), so a refresh can never move a contact backwards.
+    let lastMsgTime = prev.lastMsgTime || null;
+    if (latest && (!lastMsgTime || new Date(latest.created_at) > new Date(lastMsgTime))) {
+      lastMsgTime = latest.created_at;
+    }
+    contactMeta[u.id] = {
+      ...prev,
+      lastMsgTime,
+      lastMsgSender: latest ? latest.sender_id : (prev.lastMsgSender || null)
+    };
+    u._lastMsgTime = lastMsgTime;
+
+    // Unread reconcile: if their message is the latest one and it's newer
+    // than my last_read_at marker, it's unread. Skipped only when that chat
+    // is open right now (I'm reading it) or a live count already exists.
     const meta = contactMeta[u.id];
-    if (!(meta.unread > 0) && meta.lastMsgSender && String(meta.lastMsgSender) === String(u.id)) {
+    const chatOpenNow = activeChatContact && String(activeChatContact.id) === String(u.id);
+    if (!chatOpenNow && !(meta.unread > 0) && latest && String(latest.sender_id) === String(u.id)) {
       const lastRead = myLastReadMap[u.id];
-      if (meta.lastMsgTime && (!lastRead || new Date(meta.lastMsgTime) > new Date(lastRead))) {
+      if (!lastRead || new Date(latest.created_at) > new Date(lastRead)) {
         contactMeta[u.id] = { ...meta, unread: 1 };
       }
     }
@@ -18335,15 +18347,59 @@ document.addEventListener('DOMContentLoaded', async () => {
 // ═══════════════════════════════════════
 // VOICE MESSAGES
 // ═══════════════════════════════════════
-let voiceMediaRecorder = null;
+// Records via the native @capgo/capacitor-audio-recorder plugin when
+// running as the installed APK, instead of the browser's getUserMedia().
+// getUserMedia() goes through the WebView's own separate permission
+// bridge (WebChromeClient.onPermissionRequest) — on this device that
+// bridge was silently denying the mic even after Android's own RECORD_AUDIO
+// permission was granted. The native plugin uses Android's MediaRecorder
+// directly, the same reliable path the photo/file upload picker already
+// uses, sidestepping that broken bridge entirely. When running as a plain
+// PWA in a regular browser (no Capacitor), it falls back to the original
+// getUserMedia()/MediaRecorder approach unchanged.
+let voiceMediaRecorder = null; // web-fallback path only
 let voiceChunks = [];
 let voiceRecordingType = null; // 'private' | 'group'
+let _nativeVoiceRecording = false; // true while the native plugin path is active
+
+function _getAudioRecorderPlugin() {
+  return (window.Capacitor && window.Capacitor.Plugins) ? window.Capacitor.Plugins.CapacitorAudioRecorder : null;
+}
 
 async function startVoiceRecord(type) {
-  if (voiceMediaRecorder) return; // already recording
+  if (voiceMediaRecorder || _nativeVoiceRecording) return; // already recording
   // Block non-admins from voice recording in admin-only groups
   if (type === 'group' && activeGroup && (activeGroup.msg_permission || 'all') === 'admin' && !activeGroup.isAdmin) return;
 
+  const isNative = window.Capacitor && window.Capacitor.isNativePlatform && window.Capacitor.isNativePlatform();
+  const AudioRecorder = _getAudioRecorderPlugin();
+
+  if (isNative && AudioRecorder) {
+    try {
+      let perm = await AudioRecorder.checkPermissions();
+      if (perm.recordAudio !== 'granted') {
+        perm = await AudioRecorder.requestPermissions();
+      }
+      if (perm.recordAudio !== 'granted') {
+        alert('Microphone access denied. Please allow mic permission and try again.');
+        return;
+      }
+      await AudioRecorder.startRecording();
+      _nativeVoiceRecording = true;
+      voiceRecordingType = type;
+      const btn = document.getElementById(type + '-mic-btn');
+      const label = document.getElementById(type + '-mic-label');
+      if (btn) btn.classList.add('recording');
+      if (label) label.classList.add('show');
+    } catch (err) {
+      console.error('Native voice record start failed:', err);
+      alert('Microphone access denied. Please allow mic permission and try again.');
+      _nativeVoiceRecording = false;
+    }
+    return;
+  }
+
+  // Web/PWA fallback — original getUserMedia() path, unchanged.
   try {
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
     voiceMediaRecorder = new MediaRecorder(stream);
@@ -18356,7 +18412,6 @@ async function startVoiceRecord(type) {
 
     voiceMediaRecorder.start();
 
-    // UI feedback
     const btn = document.getElementById(type + '-mic-btn');
     const label = document.getElementById(type + '-mic-label');
     if (btn) btn.classList.add('recording');
@@ -18368,59 +18423,83 @@ async function startVoiceRecord(type) {
 }
 
 async function stopVoiceRecord(type) {
-  if (!voiceMediaRecorder || voiceMediaRecorder.state === 'inactive') return;
-
-  // UI reset
+  // UI reset (both paths)
   const btn = document.getElementById(type + '-mic-btn');
   const label = document.getElementById(type + '-mic-label');
   if (btn) btn.classList.remove('recording');
   if (label) label.classList.remove('show');
 
-  voiceMediaRecorder.stop();
+  if (_nativeVoiceRecording) {
+    const AudioRecorder = _getAudioRecorderPlugin();
+    _nativeVoiceRecording = false;
+    if (!AudioRecorder) { voiceRecordingType = null; return; }
+    try {
+      const result = await AudioRecorder.stopRecording();
+      let blob = result.blob || null;
+      if (!blob && result.uri && window.Capacitor.convertFileSrc) {
+        const src = window.Capacitor.convertFileSrc(result.uri);
+        const resp = await fetch(src);
+        blob = await resp.blob();
+      }
+      if (!blob) { voiceRecordingType = null; return; }
+      const file = new File([blob], 'voice-' + Date.now() + '.m4a', { type: blob.type || 'audio/aac' });
+      await _uploadAndSendVoice(file, type);
+    } catch (err) {
+      console.error('Native voice record stop failed:', err);
+      alert('Failed to send voice message. Try again.');
+    }
+    voiceRecordingType = null;
+    return;
+  }
 
-  // Wait for all chunks, then upload
+  // Web/PWA fallback path — original logic, unchanged.
+  if (!voiceMediaRecorder || voiceMediaRecorder.state === 'inactive') return;
+  voiceMediaRecorder.stop();
   voiceMediaRecorder.onstop = async () => {
     const stream = voiceMediaRecorder.stream;
     stream.getTracks().forEach(t => t.stop()); // release mic
-
     if (!voiceChunks.length) { voiceMediaRecorder = null; return; }
-
     const blob = new Blob(voiceChunks, { type: 'audio/webm' });
     const file = new File([blob], 'voice-' + Date.now() + '.webm', { type: 'audio/webm' });
-
-    try {
-      const { url, publicId } = await uploadToCloudinary(file);
-      if (type === 'private' && activeChatContact) {
-        const voiceBody = {
-          sender_id: currentUser.id, receiver_id: activeChatContact.id,
-          file_url: url, file_type: 'voice', public_id: publicId
-        };
-        const expiresAt = privateExpiresAt();
-        if (expiresAt) voiceBody.expires_at = expiresAt;
-        await sbQuery('POST', 'messages', voiceBody);
-        broadcastPrivateMessageSent(activeChatContact.id);
-        await loadPrivateMessages();
-        const area = document.getElementById('private-messages-area');
-        if (area) area.scrollTop = area.scrollHeight;
-      } else if (type === 'group' && activeGroup) {
-        await sbQuery('POST', 'group_messages', {
-          group_id: activeGroup.id, sender_id: currentUser.id,
-          file_url: url, file_type: 'voice', public_id: publicId
-        });
-        broadcastGroupMessageSent(activeGroup.id);
-        await loadGroupMessages();
-        const area = document.getElementById('group-messages-area');
-        if (area) area.scrollTop = area.scrollHeight;
-      }
-    } catch (err) {
-      console.error('Voice upload failed:', err);
-      alert('Failed to send voice message. Try again.');
-    }
-
+    await _uploadAndSendVoice(file, type);
     voiceMediaRecorder = null;
     voiceChunks = [];
     voiceRecordingType = null;
   };
+}
+
+// Shared Cloudinary-upload + Supabase-send tail for both recording paths —
+// identical to the original single-path implementation, just factored out
+// so it's not duplicated between the native and web branches above.
+async function _uploadAndSendVoice(file, type) {
+  try {
+    const { url, publicId } = await uploadToCloudinary(file);
+    if (type === 'private' && activeChatContact) {
+      const voiceBody = {
+        sender_id: currentUser.id, receiver_id: activeChatContact.id,
+        file_url: url, file_type: 'voice', public_id: publicId
+      };
+      const expiresAt = privateExpiresAt();
+      if (expiresAt) voiceBody.expires_at = expiresAt;
+      await sbQuery('POST', 'messages', voiceBody);
+      broadcastPrivateMessageSent(activeChatContact.id);
+      await loadPrivateMessages();
+      const area = document.getElementById('private-messages-area');
+      if (area) area.scrollTop = area.scrollHeight;
+    } else if (type === 'group' && activeGroup) {
+      await sbQuery('POST', 'group_messages', {
+        group_id: activeGroup.id, sender_id: currentUser.id,
+        file_url: url, file_type: 'voice', public_id: publicId
+      });
+      broadcastGroupMessageSent(activeGroup.id);
+      await loadGroupMessages();
+      const area = document.getElementById('group-messages-area');
+      if (area) area.scrollTop = area.scrollHeight;
+    }
+  } catch (err) {
+    console.error('Voice upload failed:', err);
+    alert('Failed to send voice message. Try again.');
+  }
 }
 
 // Renders a voice message bubble with waveform bars and play button
