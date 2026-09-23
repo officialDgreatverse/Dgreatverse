@@ -5672,7 +5672,25 @@ const unreadMap = {};
 // (re)connect is worth triggering a resync for.
 let _contactsLoadWasOffline = false;
 
-async function loadContacts() {
+// GUARD: loadContacts() can be triggered several times in quick succession
+// on a single reconnect (the browser 'online' event, visibilitychange, AND
+// each realtime channel's own SUBSCRIBED handler all call it independently).
+// Without this guard, two overlapping calls each build their OWN fresh
+// myContacts array and finish at different times — whichever one's
+// per-contact lastMsgTime lookups resolve last "wins" and re-sorts, even if
+// it started from a moment when the other call's data was incomplete. That
+// race is what caused a contact to jump up, drop back down, then jump back
+// up again after sending a message. Now a second call while one is already
+// running just waits for and returns the same in-flight result instead of
+// starting a competing one.
+let _loadContactsInFlight = null;
+function loadContacts() {
+  if (_loadContactsInFlight) return _loadContactsInFlight;
+  _loadContactsInFlight = _loadContactsImpl().finally(() => { _loadContactsInFlight = null; });
+  return _loadContactsInFlight;
+}
+
+async function _loadContactsImpl() {
   // renderCachedContactsImmediately() (called at app open, and by the
   // SUBSCRIBED reconnect handler in joinContactsRealtime()) already put the
   // last-known list on screen before this ever runs — this function's job
