@@ -4117,7 +4117,7 @@ setupOfflineBanner();
 // stale/empty data from while we were offline — no user action needed.
 window.addEventListener('online', () => {
   if (!currentUser) return;
-  resyncVisibleScreenOnReconnect();
+  requestResync();
 });
 
 // BACKUP TRIGGER for the APK/WebView build — the browser 'online' event
@@ -4131,7 +4131,7 @@ window.addEventListener('online', () => {
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState !== 'visible') return;
   if (!currentUser) return;
-  resyncVisibleScreenOnReconnect();
+  requestResync();
 });
 
 // Refreshes whichever screen(s) the person is actually looking at right
@@ -4203,6 +4203,29 @@ function resyncVisibleScreenOnReconnect() {
   if (zoneScreen && zoneScreen.classList.contains('active') && typeof refreshZoneHome === 'function') {
     refreshZoneHome().catch(e => console.log('reconnect: refreshZoneHome skipped', e));
   }
+}
+
+// SINGLE ENTRY POINT for "we might have just reconnected, resync" — every
+// trigger in the app (browser 'online' event, visibilitychange, Capacitor's
+// native 'resume' event, and each of the 3 realtime channels' own SUBSCRIBED
+// handler) used to call resyncVisibleScreenOnReconnect() directly and
+// independently. On a real reconnect all of those tend to fire within the
+// same second or two of each other, so a single "coming back online" moment
+// was triggering 4-6 separate full contact-list rebuilds back to back —
+// which is what showed up as a contact jumping to the top, dropping back
+// down, then jumping back up: not bad data, just the list being torn down
+// and redrawn repeatedly in a burst. Every trigger now calls requestResync()
+// instead, which waits a short beat and collapses however many calls came
+// in during that window into exactly ONE resyncVisibleScreenOnReconnect()
+// call — one fetch, one sort, one render, no matter how many of the
+// underlying signals fired.
+let _resyncDebounceTimer = null;
+function requestResync() {
+  if (_resyncDebounceTimer) clearTimeout(_resyncDebounceTimer);
+  _resyncDebounceTimer = setTimeout(() => {
+    _resyncDebounceTimer = null;
+    resyncVisibleScreenOnReconnect();
+  }, 600);
 }
 
 // ═══════════════════════════════════════
@@ -9964,7 +9987,7 @@ function joinContactsRealtime() {
         // callback, never a timer/poll.
         if (_contactsLoadWasOffline || _contactsChannelEverUp) {
           _contactsLoadWasOffline = false;
-          resyncVisibleScreenOnReconnect();
+          requestResync();
         }
         _contactsChannelEverUp = true;
       }
@@ -10024,7 +10047,7 @@ document.addEventListener('visibilitychange', async () => {
     // is the trigger here instead. loadContacts()/loadGroups() etc. already
     // check navigator.onLine internally, so if we're still actually offline
     // this is a harmless no-op that falls back to the cached list.
-    resyncVisibleScreenOnReconnect();
+    requestResync();
   }
 });
 
@@ -10061,7 +10084,7 @@ document.addEventListener('visibilitychange', async () => {
     joinGroupMessagesRealtime();
     joinPrivateMessagesRealtime();
     joinInboxTypingChannel();
-    resyncVisibleScreenOnReconnect();
+    requestResync();
   });
 })();
 
@@ -10170,7 +10193,7 @@ function joinGroupMessagesRealtime() {
       }
       if (status === 'SUBSCRIBED') {
         // Same reconnect-catch-up as the private-message channel above.
-        if (_groupChannelEverUp) resyncVisibleScreenOnReconnect();
+        if (_groupChannelEverUp) requestResync();
         _groupChannelEverUp = true;
       }
     });
@@ -10313,7 +10336,7 @@ function joinPrivateMessagesRealtime() {
         // never backgrounded — visibilitychange/Capacitor 'resume' wouldn't
         // have fired, so this is the only signal we get. Any broadcast
         // missed during the gap is gone for good; catch up once here.
-        if (_privateChannelEverUp) resyncVisibleScreenOnReconnect();
+        if (_privateChannelEverUp) requestResync();
         _privateChannelEverUp = true;
       }
     });
