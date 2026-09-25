@@ -20174,6 +20174,7 @@ applyWallpaper();
 let dgvDeferredInstallPrompt = null;
 let dgvUpdateWaitingWorker = null;
 let dgvApkUpdateInfo = null; // set when version.json on GitHub reports a newer APK build
+let dgvLatestApkUrl = null;  // set from version.json regardless of version — powers the website's "Download App" bubble
 
 // Bump this to match the versionCode in version.json every time you cut a
 // new APK release via build-apk.yml. This is the ONE manual step — the web
@@ -20186,10 +20187,11 @@ function checkForApkUpdate() {
   fetch(DGV_VERSION_JSON_URL, { cache: 'no-store' })
     .then(function (r) { return r.json(); })
     .then(function (data) {
+      if (data && data.apkUrl) dgvLatestApkUrl = data.apkUrl;
       if (data && typeof data.versionCode === 'number' && data.versionCode > CURRENT_APK_VERSION_CODE) {
         dgvApkUpdateInfo = data; // { versionCode, versionName, apkUrl, notes }
-        refreshPupNotify();
       }
+      refreshPupNotify();
     })
     .catch(function () { /* offline or rate-limited — fail silently */ });
 }
@@ -20199,17 +20201,28 @@ function dgvIsAppInstalled() {
          window.navigator.standalone === true;
 }
 
+// True only inside the installed Android APK (Capacitor's native bridge). False for every
+// browser visit to the GitHub Pages site, whether or not it's also been "installed" as a PWA.
+function dgvIsNativeApk() {
+  return !!(window.Capacitor && window.Capacitor.isNativePlatform && window.Capacitor.isNativePlatform());
+}
+
 function refreshPupNotify() {
-  // Release build: only the APK-update checker drives this bubble.
-  // No "Install App" state, no service-worker "Update App" state —
-  // those only make sense on the web version. If there's no newer
-  // APK available, the bubble stays fully hidden.
+  // Two independent jobs share this one bubble above PUP's head:
+  //  - Inside the installed APK: only the update checker drives it ("Update vX.X"),
+  //    same as before.
+  //  - On the plain website (officialdgreatverse.github.io): a permanent
+  //    "Download App" sign, so a browser visitor can grab the APK straight
+  //    from GitHub with one tap, once version.json has told us where it is.
   const bubble = document.getElementById('pup-notify');
   const label = document.getElementById('pup-notify-text');
   if (!bubble || !label) return;
 
   if (dgvApkUpdateInfo) {
     label.textContent = `Update v${dgvApkUpdateInfo.versionName || dgvApkUpdateInfo.versionCode}`;
+    bubble.classList.add('show');
+  } else if (!dgvIsNativeApk() && dgvLatestApkUrl) {
+    label.textContent = 'Download App';
     bubble.classList.add('show');
   } else {
     bubble.classList.remove('show');
@@ -20222,6 +20235,12 @@ function handlePupNotifyClick(event) {
   if (dgvApkUpdateInfo) {
     // Take them straight to the new APK so they can download/install it.
     if (dgvApkUpdateInfo.apkUrl) window.open(dgvApkUpdateInfo.apkUrl, '_blank');
+    return;
+  }
+
+  if (!dgvIsNativeApk() && dgvLatestApkUrl) {
+    // Website visitor tapping "Download App" — pull the current release APK from GitHub.
+    window.open(dgvLatestApkUrl, '_blank');
     return;
   }
 
